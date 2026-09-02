@@ -1,0 +1,992 @@
+"""ShootPX — On-Model Shots: shared flow logic.
+
+One module, two frontends: shootpx_on_model_flow.ipynb (unattended, auto-approve) and
+streamlit_app.py (interactive, human approve/regenerate). Neither frontend duplicates this
+logic — they only call into it and render results their own way (the `on_image` callback
+below is the seam: notebook defaults to `show()`, Streamlit passes `st.image`).
+
+Every model is confirmed and read from `.env` via MODEL_CONFIG — nothing hardcoded. See the
+mermaid flow diagram in shootpx_on_model_flow.ipynb's first cell for the full picture; every
+function below is commented with which node(s) of that diagram it implements.
+"""
+
+import io
+import json
+import os
+import re
+from typing import TypedDict
+
+import fal_client
+import requests
+from dotenv import load_dotenv
+from PIL import Image
+
+load_dotenv()
+
+assert os.environ.get("FAL_KEY"), "Set FAL_KEY in .env before running."
+
+# --- MODEL_CONFIG: the ONE place to see/swap every model this flow calls. ---
+# All read straight from .env, no code-side fallback drift risk.
+MODEL_CONFIG = {
+    "final_generation": os.environ["FINAL_GENERATION_MODEL"],   # Seedream 4.5 edit
+    "text_to_image": os.environ["TEXT_TO_IMAGE_MODEL"],          # Seedream 4.5 text-to-image
+    "vlm_endpoint": "openrouter/router/vision",                  # fal slug every VLM/LLM call below goes through
+    "prompt_writer": os.environ["PROMPT_WRITER_MODEL"],          # Gemini 2.5 Flash, via vlm_endpoint
+    "safety_check": os.environ["SAFETY_CHECK_MODEL"],            # Gemini 2.5 Flash, via vlm_endpoint
+}
+
+
+# =============================================================================
+# 1. Shared helpers
+# =============================================================================
+
+def to_hosted_url(path_or_url: str) -> str:
+    """Return a fal-hosted URL for a local file, or pass a URL through unchanged."""
+    if path_or_url.startswith("http://") or path_or_url.startswith("https://"):
+        return path_or_url
+    return fal_client.upload_file(path_or_url)
+
+
+def show(url_or_path: str, caption: str = ""):
+    """Default `on_image` renderer — notebook/IPython display. Streamlit passes its own
+    (st.image) instead; nothing in this module calls show() directly except the defaults
+    below, so swapping frontends never touches this function."""
+    from IPython.display import display  # imported here so this module has no hard IPython dep
+
+    if url_or_path.startswith("http"):
+        img = Image.open(io.BytesIO(requests.get(url_or_path, timeout=30).content))
+    else:
+        img = Image.open(url_or_path)
+    print(caption)
+    display(img)
+
+
+def fetch_image_bytes(url: str) -> bytes:
+    """Raw GET — used both by download_image() below and by streamlit_app.py's download
+    buttons (which need bytes in memory, not a file on disk)."""
+    return requests.get(url, timeout=30).content
+
+
+def download_image(url: str, out_path: str) -> str:
+    """Save a generated image to local disk. fal output URLs are NOT permanent (confirmed:
+    subject to the same X-Fal-Object-Lifecycle-Preference retention controls as uploads, and
+    are permanently deleted once they expire) — call this before you need the file long-term,
+    not just store the URL."""
+    with open(out_path, "wb") as f:
+        f.write(fetch_image_bytes(url))
+    return out_path
+
+
+def _strip_json_fence(text: str) -> str:
+    """Gemini (and most chat models) often wrap JSON in ```json ... ``` even when told not
+    to. Strip that before parsing so we don't hard-fail on the fence, not the content."""
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1] if "\n" in text else text[3:]
+        if text.endswith("```"):
+            text = text[:-3]
+        text = text.strip()
+        if text.lower().startswith("json"):
+            text = text[4:].strip()
+    return text
+
+
+def _extract_json_text(text: str) -> str:
+    """Fence-strip, then (real failure, 2026-08-29, reasoning-mandatory models like
+    gemini-3.1-pro-preview) fall back to pulling out the outermost {...}/[...] block if the
+    text still isn't valid JSON on its own — a reasoning model's thinking trace can land in
+    the same `output` string ahead of its actual JSON answer."""
+    text = _strip_json_fence(text)
+    try:
+        json.loads(text, strict=False)  # strict=False: tolerate literal control chars (raw
+        return text                     # newlines etc.) inside string values — real failure,
+    except json.JSONDecodeError:        # 2026-08-29: "Unterminated string" from a multi-line
+        pass                            # prompt Gemini didn't escape as \n
+    for open_ch, close_ch in (("{", "}"), ("[", "]")):
+        start, end = text.find(open_ch), text.rfind(close_ch)
+        if start != -1 and end != -1 and end > start:
+            candidate = text[start:end + 1]
+            try:
+                json.loads(candidate, strict=False)
+                return candidate
+            except json.JSONDecodeError:
+                continue
+    return text  # give up — let json.loads raise with the real parse error
+
+
+def _vlm_json_call(model: str, system: str, prompt: str, image_urls: list[str] | None = None, max_tokens: int = 1000) -> dict:
+    """One call through fal's `openrouter/router/vision` (MODEL_CONFIG['vlm_endpoint']) —
+    `model` picks the underlying model. Works with or without images (image_urls=None is a
+    plain text LLM call, used by generate_model_prompt_via_llm below). `reasoning: True` is
+    mandatory for some models on this endpoint (confirmed, 2026-08-29: gemini-3.1-pro-preview
+    400s without it — "Reasoning is mandatory for this endpoint and cannot be disabled") —
+    sent unconditionally, since non-reasoning models just ignore it. Must return a bare JSON
+    object/array as text; parsed via _extract_json_text (handles reasoning trace + fences)."""
+    args = {
+        "model": model,
+        "system_prompt": system,
+        "prompt": prompt,
+        "max_tokens": max_tokens,
+        "temperature": 0,
+        "reasoning": True,
+    }
+    if image_urls:
+        args["image_urls"] = image_urls
+    result = fal_client.subscribe(MODEL_CONFIG["vlm_endpoint"], arguments=args, with_logs=True)
+    output = result.get("output", "")
+    try:
+        return json.loads(_extract_json_text(output), strict=False)
+    except json.JSONDecodeError as e:
+        # Real failure, 2026-08-31: a reasoning-mandatory model (reasoning=True above) can
+        # burn its whole max_tokens budget on the hidden reasoning trace and return
+        # near-empty/non-JSON content — every extraction strategy in _extract_json_text then
+        # fails too. A bare JSONDecodeError gives no way to tell that apart from a real
+        # parsing bug, so surface what the model actually returned.
+        snippet = output[:500] + ("..." if len(output) > 500 else "")
+        raise RuntimeError(
+            f"{model} did not return valid JSON ({e}). Raw output: {snippet!r}"
+        ) from e
+
+
+# =============================================================================
+# 2. Model Source — generate / upload / default
+# =============================================================================
+# Matches the left/middle/right branches of the diagram: both NSFW gates (on the LLM-written
+# description, before spending a generation call; and on the generated image, before showing
+# a preview) and the approve/regenerate loop for the `generate` path.
+
+MODEL_LIBRARY = {
+    # "preset_id": "path/or/url/to/model.jpg" — pre-vetted, skips the NSFW check below.
+    "preset_1": "assets/models/preset_1.jpg",
+    "preset_2": "assets/models/preset_2.jpg",
+}
+
+DESCRIPTION_BLOCKED_TERMS = ["child", "minor", "teen", "kid", "underage"]
+
+# Structured-picker options for the "generate" path. Deliberately adult-only — no "children"/
+# "youth" bracket, unlike a typical reference UI — this has to stay consistent with the nsfw/
+# minor safety gates already built into this flow, not just mirror a competitor's screenshot.
+GENDER_OPTIONS = ["Female", "Male"]
+# Bracket bumped from "(20s)" to "(25-30)" — real-world failure, 2026-08-29: "20s" alone
+# doesn't anchor the text-to-image model away from youthful/ambiguous faces, and the
+# safety-check VLM correctly flagged the result as looking underage. Starting the range at
+# 25 gives real headroom before the ambiguous-age zone.
+AGE_BRACKET_OPTIONS = ["Young adult (25-30)", "Adult (30s-40s)", "Mature adult (50+)"]
+SKIN_TONE_OPTIONS = ["Fair", "Light", "Tan", "Deep"]
+BODY_TYPE_OPTIONS = ["Slim", "Athletic", "Average", "Curvy", "Plus size"]
+
+# Real-world failure, 2026-08-29: a prompt saying "a young adult female in her 20s" produced
+# an image the safety-check VLM flagged as looking underage — passing the age bracket through
+# as a bare label doesn't push the image model toward unambiguous adult features. Now
+# explicitly instructed to describe visual maturity signals, not just state a number.
+MODEL_PROMPT_WRITER_SYSTEM = """You write a single, vivid, photorealistic text-to-image prompt describing a human model for a professional ecommerce fashion photography studio portrait.
+
+Given structured attributes and optional additional notes, write ONE descriptive paragraph (not a list) that a text-to-image model can use directly: appearance, studio setting, neutral standing pose, lighting, photographic quality.
+
+The model should be attractive, photogenic and camera-ready the way a professional fashion catalog model is: polished, well-groomed, confident, flattering studio lighting, a genuine and warm expression. That is the actual point of this step — produce a good-looking model a fashion brand would want to use, not just a technically compliant photo.
+
+The model must also read as unmistakably an adult — mature, fully developed adult facial structure and body proportions, adult styling and grooming, confident adult posture and expression. Never describe or imply a youthful, adolescent, or age-ambiguous appearance, even for the youngest requested bracket. If there is any doubt, describe the model as visibly closer to 30 than to 18 — err toward more visibly mature, never less.
+
+Being attractive and being unambiguously adult are not in tension: professional fashion models are typically confident adults in their mid-20s to 30s — describe exactly that standard, not a compromise between "attractive" and "adult."
+
+Return only the requested JSON structure."""
+
+
+def generate_model_prompt_via_llm(gender: str, age_bracket: str, skin_tone: str, body_type: str, additional_notes: str = "") -> str:
+    """Node: feeds 'Structured picker' + 'Optional free-text refinement' into the LLM instead
+    of asking the user to write the text-to-image prompt themselves."""
+    attrs = {"gender": gender, "age_bracket": age_bracket, "skin_tone": skin_tone, "body_type": body_type}
+    prompt_text = (
+        "Structured attributes: " + json.dumps(attrs)
+        + (f"\nAdditional notes from user: {additional_notes}" if additional_notes else "")
+        + '\n\nReturn ONLY a JSON object: {"prompt": "<the single descriptive paragraph>"}.'
+    )
+    result = _vlm_json_call(
+        # max_tokens=800, not 300: PROMPT_WRITER_MODEL is a reasoning-mandatory model (see
+        # _vlm_json_call's `reasoning: True` note) — 300 left too little headroom for both
+        # the hidden reasoning trace and the actual JSON answer, producing truncated/
+        # non-JSON output (real failure, 2026-08-31: JSONDecodeError with no diagnosable
+        # cause until _vlm_json_call started surfacing the raw output above).
+        model=MODEL_CONFIG["prompt_writer"], system=MODEL_PROMPT_WRITER_SYSTEM,
+        prompt=prompt_text, image_urls=None, max_tokens=800,
+    )
+    return result["prompt"]
+
+
+def check_description_safety(description: str):
+    """Node: '1st safety layer', pass 1 — near-free keyword blocklist, before any paid
+    generation call happens. Catches the obvious cases instantly."""
+    text = description.lower()
+    for term in DESCRIPTION_BLOCKED_TERMS:
+        if term in text:
+            raise ValueError(f"Blocked term '{term}' in model description — request not sent.")
+    return True
+
+
+def check_description_safety_llm(description: str) -> tuple[bool, str]:
+    """Node: '1st safety layer', pass 2 — one cheap text-only LLM call (no image, so far
+    cheaper than a generation call) that catches what the keyword blocklist can't: subtler
+    phrasing implying an underage or otherwise unsafe subject. Runs before the paid
+    text-to-image call, same spot check_description_safety runs — the goal is rejecting a
+    bad request before spending on generation, not after. This does NOT replace
+    check_image_nsfw: a clean-sounding description can still render an ambiguous-looking
+    face, which only inspecting the actual output image can catch."""
+    result = _vlm_json_call(
+        model=MODEL_CONFIG["safety_check"],
+        system=(
+            "You are a strict content-safety classifier for an e-commerce fashion photo "
+            "pipeline, reviewing a text-to-image PROMPT before it is sent for generation "
+            "(no image exists yet). Reject it if it implies, even subtly or indirectly, an "
+            "underage or age-ambiguous subject, or sexually explicit/inappropriate content. "
+            'Respond with ONLY a JSON object: {"pass": true|false, "reason": "short reason"}.'
+        ),
+        prompt=f"Model description: {description}",
+        image_urls=None,
+        max_tokens=150,
+    )
+    return bool(result["pass"]), result.get("reason", "")
+
+
+# Calibration fix, 2026-08-29: an actually-fine adult model (loungewear, ordinary studio
+# shot) got a false-positive "appears underage" flag. Root cause — the previous wording
+# ("clearly 18+, no ambiguity") gave the VLM no way to distinguish "youthful bone structure
+# on an obvious adult" from "genuinely could be a minor", so it flagged on ANY youthfulness.
+# Recalibrated to require a specific, real reason to suspect a minor, and to explicitly say
+# normal underwear/lingerie e-commerce photography isn't inherently "explicit" — this is a
+# bra/underwear business, that content is the product, not a violation.
+def check_image_nsfw(image_url: str) -> tuple[bool, str]:
+    """Node: 'Check for nsfw image' / 'Check generated image for nsfw'. VLM-based —
+    model is MODEL_CONFIG['safety_check'], swap it there. Returns (is_clean, reason)."""
+    result = _vlm_json_call(
+        model=MODEL_CONFIG["safety_check"],
+        system=(
+            "You are a content-safety classifier for an e-commerce fashion photo pipeline. "
+            "Given one image, check two things only:\n"
+            "1. Age: does the person look like they could plausibly be under 18 — not just "
+            "youthful-looking, but a genuine, specific reason to suspect a minor? Professional "
+            "adult models often have soft studio lighting, natural/minimal makeup, or delicate "
+            "features and are still obviously adult. Do NOT flag on youthfulness alone — only "
+            "flag with a real, articulable reason.\n"
+            "2. Explicit content: is the image sexually explicit (visible nudity, exposed "
+            "genitalia/nipples, sexual acts or poses)? Ordinary e-commerce underwear/lingerie/"
+            "swimwear photography — the actual product being sold — is NOT explicit on its own.\n"
+            'Respond with ONLY a JSON object: {"clean": true|false, "reason": "short reason"}.'
+        ),
+        prompt="Classify this image per the rules in the system prompt.",
+        image_urls=[image_url],
+        max_tokens=200,
+    )
+    return bool(result["clean"]), result.get("reason", "")
+
+
+def generate_model_via_text2image(description: str, image_size: str = "portrait_4_3") -> str:
+    """Node: 'Text-to-Image call'."""
+    result = fal_client.subscribe(
+        MODEL_CONFIG["text_to_image"],
+        arguments={"prompt": description, "image_size": image_size, "num_images": 1},
+        with_logs=True,
+    )
+    return result["images"][0]["url"]
+
+
+def generate_model_candidate(gender: str, age_bracket: str, skin_tone: str, body_type: str, additional_notes: str = "") -> dict:
+    """One full attempt: LLM writes the prompt -> hard-check the description (keyword, then
+    LLM) -> text-to-image -> nsfw-check the result. The two description checks run BEFORE the
+    paid text-to-image call, so an obviously bad request never reaches it. The image check
+    does NOT raise on a flag — the caller (UI) decides whether to show an error, auto-retry,
+    or let a human override an obvious false positive after actually looking at the image.
+    This is the single-attempt building block; resolve_model_via_generate below loops it for
+    unattended use, and streamlit_app.py calls it directly per button click for interactive
+    approve/regenerate."""
+    description = generate_model_prompt_via_llm(gender, age_bracket, skin_tone, body_type, additional_notes)
+    check_description_safety(description)
+    passed, reason = check_description_safety_llm(description)
+    if not passed:
+        raise ValueError(f"Blocked at prompt-level safety check: {reason}")
+    url = generate_model_via_text2image(description)
+    clean, reason = check_image_nsfw(url)
+    return {"url": url, "clean": clean, "reason": reason, "description": description}
+
+
+def resolve_model_via_generate(
+    gender: str, age_bracket: str, skin_tone: str, body_type: str,
+    additional_notes: str = "", approve_fn=lambda url: True, on_image=None, max_attempts: int = 3,
+) -> str:
+    """Nodes: structured picker -> free-text refinement -> 1st safety layer -> Text-to-Image
+    call -> nsfw check -> preview -> Approve?. Loops on a failed nsfw check or a
+    'No, regenerate' from approve_fn, up to max_attempts. Unattended/notebook use — for an
+    interactive UI, call generate_model_candidate() per button click instead (see
+    streamlit_app.py) since a real approve/regenerate loop needs UI state between attempts,
+    not a blocking Python loop.
+
+    approve_fn(url) -> bool is the human-approval hook; defaults to auto-approve so this runs
+    unattended in a notebook. on_image(url, caption) renders each preview; defaults to show().
+    """
+    on_image = on_image or show
+    for attempt in range(1, max_attempts + 1):
+        candidate = generate_model_candidate(gender, age_bracket, skin_tone, body_type, additional_notes)
+        if not candidate["clean"]:
+            print(f"[attempt {attempt}] generated image flagged nsfw ({candidate['reason']}) — regenerating")
+            continue
+        on_image(candidate["url"], f"Preview — attempt {attempt}")
+        if approve_fn(candidate["url"]):
+            return candidate["url"]  # -> 'Save as Model Library asset' happens at the caller if desired
+        print(f"[attempt {attempt}] not approved — regenerating")
+
+    raise RuntimeError(f"Could not produce an approved, clean model image in {max_attempts} attempts.")
+
+
+def resolve_model_via_upload(path_or_url: str) -> str:
+    """Nodes: Upload Model -> Check for nsfw image -> Upload to hosted storage.
+    An NSFW upload can't be regenerated — raise and let the caller ask for a different file
+    ('If NSFW' loops back to Model Source? in the diagram)."""
+    hosted_url = to_hosted_url(path_or_url)
+    clean, reason = check_image_nsfw(hosted_url)
+    if not clean:
+        raise ValueError(f"Uploaded model image flagged nsfw ({reason}) — please upload a different photo.")
+    return hosted_url
+
+
+def resolve_model_via_default(preset_id: str) -> str:
+    """Node: Pick from Model Library — presets are pre-vetted, no nsfw check needed."""
+    return to_hosted_url(MODEL_LIBRARY[preset_id])
+
+
+def resolve_model_image(
+    mode: str,
+    gender: str = "", age_bracket: str = "", skin_tone: str = "", body_type: str = "",
+    additional_notes: str = "",
+    upload_path: str | None = None,
+    preset_id: str | None = None,
+    approve_fn=lambda url: True,
+    on_image=None,
+) -> str:
+    """mode: 'generate' | 'upload' | 'default' — dispatches to the three branches above and
+    returns model_image_url."""
+    if mode == "generate":
+        return resolve_model_via_generate(gender, age_bracket, skin_tone, body_type, additional_notes, approve_fn, on_image)
+    if mode == "upload":
+        return resolve_model_via_upload(upload_path)
+    if mode == "default":
+        return resolve_model_via_default(preset_id)
+    raise ValueError(f"Unknown model mode: {mode}")
+
+
+# =============================================================================
+# 3. Products + reference images
+# =============================================================================
+# A "product" is one physical item the shot needs to show worn/carried — a top, a pair of
+# shoes, a watch, a bag, anything. Multiple photos of the SAME item are multiple images on ONE
+# product; a second item (e.g. Bottom vs Top) is a second product. This replaced a flat
+# garment_paths list + a user-typed garment_type string (see section 5 below for why) — the
+# user no longer says what a product IS, only uploads it and optionally gives it a label.
+
+
+class Product(TypedDict):
+    id: str               # slug, deduped — used internally, never shown to the user
+    label: str             # display label: "Top", "Bottom", "Watch", "Garment 3", ...
+    image_paths: list[str]  # 1+ local paths or URLs, all of the same physical product
+
+
+def _slugify(label: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", label.strip().lower()).strip("_") or "product"
+
+
+def make_product(label: str, image_paths: list[str], existing_ids: set[str] | None = None) -> Product:
+    """Builds one Product from a UI slot. A blank label defaults to 'Garment' — the user is
+    never required to type anything (Single Garment mode never calls this with a label at
+    all; see streamlit_app.py). existing_ids lets the caller dedup labels typed twice (two
+    custom slots both called "Watch") into distinct ids, since classify_products_via_vlm and
+    assemble_inputs below both key off id."""
+    label = label.strip() or "Garment"
+    existing_ids = existing_ids if existing_ids is not None else set()
+    base_id = _slugify(label)
+    product_id, n = base_id, 2
+    while product_id in existing_ids:
+        product_id = f"{base_id}_{n}"
+        n += 1
+    return {"id": product_id, "label": label, "image_paths": list(image_paths)}
+
+
+# Node: 'Assemble ordered image list + labels' -> 'Total images <= 10?'. Raising here (rather
+# than silently trimming) matches the diagram's explicit reject-and-suggest-trim step.
+
+def assemble_inputs(model_image: str, products: list[Product], reference_images: list[str] | None = None):
+    """Returns (image_urls, labels) in order. Raises if the fal input-count ceiling (10) is
+    exceeded, naming exactly how many images need to be trimmed."""
+    reference_images = reference_images or []
+    total_product_images = sum(len(p["image_paths"]) for p in products)
+    total = 1 + total_product_images + len(reference_images)
+    if total > 10:
+        raise ValueError(
+            f"{total} images (1 model + {total_product_images} product + "
+            f"{len(reference_images)} reference) exceeds the 10-image limit — "
+            f"trim {total - 10} image(s) and try again."
+        )
+
+    urls = [model_image]
+    labels = ["Image 1 = model reference"]
+    for product in products:
+        n = len(product["image_paths"])
+        for i, path in enumerate(product["image_paths"], start=1):
+            urls.append(path)
+            angle = f" ({i}/{n})" if n > 1 else ""
+            labels.append(f"Image {len(labels)+1} = product '{product['label']}'{angle}, exact product, preserve fidelity")
+    for r in reference_images:
+        urls.append(r)
+        labels.append(f"Image {len(labels)+1} = style/pose reference only")
+
+    image_urls = [to_hosted_url(u) for u in urls]
+    return image_urls, labels
+
+
+# =============================================================================
+# 4. Output settings — aspect ratio / resolution
+# =============================================================================
+# Only final_generation (Seedream 4.5 edit) is wired, so this maps straight to its
+# image_size preset vocabulary.
+
+ASPECT_RATIO_MAP = {
+    "1:1": "square_hd",
+    "3:4": "portrait_4_3",
+    "9:16": "portrait_16_9",
+    "4:3": "landscape_4_3",
+    "16:9": "landscape_16_9",
+}
+
+# Confirmed live against fal's Seedream 4.5 edit schema, 2026-08-29: image_size is either one
+# of the named presets above (aspect ratio + resolution baked into one value — no separate
+# resolution control for those), the two resolution-priority values below (model decides
+# aspect ratio from the inputs), or a custom {width, height} object bound by these limits.
+RESOLUTION_MODES = ["standard", "auto_2K", "auto_4K", "custom"]
+SEEDREAM_MIN_DIM = 1920
+SEEDREAM_MAX_DIM = 4096
+SEEDREAM_MIN_TOTAL_PX = 2560 * 1440   # 3,686,400
+SEEDREAM_MAX_TOTAL_PX = 4096 * 4096   # 16,777,216
+
+
+def validate_custom_size(width: int, height: int) -> None:
+    """Raises ValueError if width/height don't satisfy Seedream's documented constraint:
+    each side 1920-4096px, OR total pixel count 2560x1440-4096x4096."""
+    per_axis_ok = SEEDREAM_MIN_DIM <= width <= SEEDREAM_MAX_DIM and SEEDREAM_MIN_DIM <= height <= SEEDREAM_MAX_DIM
+    total_px = width * height
+    total_ok = SEEDREAM_MIN_TOTAL_PX <= total_px <= SEEDREAM_MAX_TOTAL_PX
+    if not (per_axis_ok or total_ok):
+        raise ValueError(
+            f"{width}x{height} isn't a valid size: each side must be "
+            f"{SEEDREAM_MIN_DIM}-{SEEDREAM_MAX_DIM}px, or total pixels must be "
+            f"{SEEDREAM_MIN_TOTAL_PX:,}-{SEEDREAM_MAX_TOTAL_PX:,} (you gave {total_px:,})."
+        )
+
+
+def build_image_size(resolution_mode: str = "standard", aspect_ratio: str = "3:4", custom_width: int | None = None, custom_height: int | None = None):
+    """resolution_mode: 'standard' (named preset from aspect_ratio, via ASPECT_RATIO_MAP) |
+    'auto_2K' | 'auto_4K' (model decides aspect ratio) | 'custom' (custom_width/custom_height,
+    validated against Seedream's limits above)."""
+    if resolution_mode == "standard":
+        if aspect_ratio not in ASPECT_RATIO_MAP:
+            raise ValueError(f"Unknown aspect_ratio {aspect_ratio!r} — one of {list(ASPECT_RATIO_MAP)}")
+        return ASPECT_RATIO_MAP[aspect_ratio]
+    if resolution_mode in ("auto_2K", "auto_4K"):
+        return resolution_mode
+    if resolution_mode == "custom":
+        if custom_width is None or custom_height is None:
+            raise ValueError("resolution_mode='custom' requires custom_width and custom_height")
+        validate_custom_size(custom_width, custom_height)
+        return {"width": custom_width, "height": custom_height}
+    raise ValueError(f"Unknown resolution_mode: {resolution_mode!r} — one of {RESOLUTION_MODES}")
+
+
+# =============================================================================
+# 5. Product understanding + router + prompt logic
+# =============================================================================
+# Node: 'Router: garment category -> intimate or general' -> picks the system prompt. Used to
+# be a keyword classifier on a user-typed garment_type string; now it's a VLM call over the
+# actual product images (see section 3's docstring for why) — the user never tells us what a
+# product is, the model looks at it.
+
+
+# Product review pass, 2026-08-29: shifted from a short imperative-checklist prompt to a full
+# creative-director brief — the goal is attractive, commercially usable output across every
+# product category (bra, t-shirt, pants, shoes, hats, watches, bags, ...), not sterile catalog
+# shots. PRODUCT-CATEGORY FRAMING tells the VLM to adapt composition per category itself
+# (e.g. show a hand for a watch, a leg for a shoe, half/full body when the product needs it)
+# rather than us hardcoding a framing rule per category.
+PROMPT_WRITER_SYSTEM_GENERAL = """You are the creative image director for ShootPX, an AI fashion ecommerce photography system.
+
+Your prompts are sent directly to a professional image-generation/editing model.
+
+The goal is to create beautiful, realistic, commercially usable product photography that a fashion brand can confidently use on ecommerce stores and marketplaces such as Myntra, Amazon, Flipkart and Shopify.
+
+The supplied product is the hero of the image. The model, pose, lighting and environment exist to present the product beautifully.
+
+Prioritize, in this order:
+1. Accurate preservation of the supplied product
+2. Clear and attractive product presentation
+3. Natural fit and believable interaction with the model
+4. Strong ecommerce composition
+5. Professional fashion photography
+6. Attractive but restrained styling
+7. Natural model expression and pose
+8. Clean, polished background and lighting
+
+PRODUCT:
+Treat the supplied product image as the source of truth.
+Preserve the product's recognizable design, silhouette, proportions, construction, materials, colors, patterns, textures, seams, stitching, trims, hardware and other visible details.
+
+Do not unnecessarily redesign, simplify or invent product details.
+
+COMPOSITION:
+Choose framing appropriate to the product category.
+The product should occupy a meaningful portion of the image and remain easy to see.
+Avoid unnecessary empty space.
+Avoid poses, hair, hands, arms, props or camera angles that hide important product details.
+Do not force every product into the same crop.
+
+PRODUCT-CATEGORY FRAMING:
+
+Choose framing based on what is being sold.
+
+Upper-body garments:
+Use upper-body or half-body framing when appropriate.
+
+Full-body garments:
+Show enough of the body to clearly present the complete garment without excessive empty space.
+
+Footwear:
+Use a lower-body or full-body composition that makes the footwear clearly visible.
+
+Watches, jewelry and small accessories:
+Use a closer composition where the product is large and easy to evaluate.
+
+Hats and headwear:
+Keep the head and product clearly visible.
+
+Bags and carried accessories:
+Show the complete product and, where useful, how it is naturally carried or worn.
+
+Do not force a fixed camera crop when it would reduce product visibility.
+
+PHOTOGRAPHY:
+Create the visual quality of a premium commercial fashion shoot rather than a generic AI-generated image.
+Use believable professional lighting, realistic shadows, accurate color, natural skin and material texture, realistic perspective and tasteful retouching.
+
+STYLE:
+Aim for aspirational, polished and contemporary ecommerce fashion photography.
+The image should feel attractive enough for a brand's storefront while remaining commercially practical.
+
+REFERENCES:
+Use the supplied product and model references as the primary source of truth.
+Additional reference images may guide composition, pose, lighting, framing or photographic style.
+Use them as visual inspiration only and do not copy unrelated products, branding, logos, text or identities.
+
+POSE VARIETY:
+When generating multiple images, make each pose and camera angle meaningfully different while maintaining product visibility and commercial usefulness.
+
+PROMPT STYLE:
+Write concise, direct instructions for the image-generation model.
+Do not write a long scene description.
+Do not unnecessarily describe attributes already visible in the reference images.
+Do not overuse negative instructions.
+Every prompt must be self-contained and directly usable by the image-generation model.
+
+Return only the requested JSON structure."""
+
+# Same creative-director philosophy as GENERAL, with intimate-apparel-specific fidelity and
+# safety guidance layered in — deliberately not a "25 things you must never do" checklist,
+# since that pushes the image model toward stiff catalog photography. Product review pass,
+# 2026-08-29.
+PROMPT_WRITER_SYSTEM_INTIMATE = """You are the creative image director for ShootPX, an AI fashion ecommerce photography system.
+
+Your prompts are sent directly to a professional image-generation/editing model.
+
+Create premium, attractive, realistic ecommerce fashion photography for brands selling products on marketplaces and online stores such as Myntra, Amazon, Flipkart and Shopify.
+
+The supplied intimate-apparel product is the commercial hero. The adult model exists to present the product naturally and professionally.
+
+The desired result should feel like high-quality mainstream fashion retail photography: polished, confident, modern, attractive and commercially usable.
+
+PRIORITY:
+1. Preserve the supplied garment accurately
+2. Present the garment clearly and attractively
+3. Achieve realistic fit and natural garment-to-body interaction
+4. Create strong ecommerce composition
+5. Produce beautiful professional photography
+6. Use a natural, confident model pose
+7. Keep the overall presentation tasteful and retail appropriate
+
+GARMENT FIDELITY:
+Treat the garment reference as the authoritative product reference.
+
+Preserve its recognizable:
+- silhouette
+- proportions
+- construction
+- materials
+- colors
+- patterns
+- textures
+- seams
+- stitching
+- trims
+- straps
+- closures
+- hardware
+- visible branding or product details
+
+The image-generation model should adapt the garment naturally to the adult model's body without unnecessarily changing the garment itself.
+
+Do not invent a different product or turn the reference garment into a generic version of the product.
+
+COMPOSITION:
+Use attractive ecommerce fashion framing appropriate to the garment.
+
+For intimate upper-body garments, generally favor close or medium upper-body compositions where the garment is large enough to clearly evaluate while still presenting the model naturally.
+
+Keep important garment areas visible.
+Avoid unnecessary obstruction from hair, hands, arms or extreme poses.
+
+The garment should receive more visual attention than the model's face, background or environment.
+
+PRODUCT-CATEGORY FRAMING:
+
+Choose framing based on what is being sold.
+
+Upper-body garments:
+Use upper-body or half-body framing when appropriate.
+
+Full-body garments:
+Show enough of the body to clearly present the complete garment without excessive empty space.
+
+Footwear:
+Use a lower-body or full-body composition that makes the footwear clearly visible.
+
+Watches, jewelry and small accessories:
+Use a closer composition where the product is large and easy to evaluate.
+
+Hats and headwear:
+Keep the head and product clearly visible.
+
+Bags and carried accessories:
+Show the complete product and, where useful, how it is naturally carried or worn.
+
+Do not force a fixed camera crop when it would reduce product visibility.
+
+PHOTOGRAPHY:
+Aim for premium commercial fashion photography with:
+- soft professional lighting
+- realistic shadows
+- accurate color
+- realistic skin and fabric texture
+- believable perspective
+- natural proportions
+- refined but realistic retouching
+- clean contemporary styling
+
+Do not make every image look identical. Allow tasteful variation in pose, camera angle, expression, lighting and composition while maintaining product visibility.
+
+REFERENCE IMAGES:
+Use supplied images as the source of truth for the person and product.
+Optional reference images can guide composition, pose, lighting or photography style.
+Do not copy unrelated branding, text, products or identities from reference images.
+
+INTIMATE APPAREL SAFETY:
+The model must be clearly an adult.
+Keep the photography suitable for mainstream fashion ecommerce.
+Use tasteful fashion poses and professional commercial presentation.
+Avoid sexualized, explicit or boudoir-style direction.
+
+PROMPT STYLE:
+Write concise, directive image-generation instructions.
+Do not unnecessarily describe details already visible in the supplied references.
+Avoid excessive negative instructions.
+Focus on giving the image model the information needed to produce an excellent commercial photograph.
+
+Return only the requested JSON structure."""
+
+PROMPT_WRITER_CONFIG = {
+    "general": {
+        "model": os.environ.get("PROMPT_WRITER_MODEL_GENERAL", MODEL_CONFIG["prompt_writer"]),
+        "system": PROMPT_WRITER_SYSTEM_GENERAL,
+    },
+    "intimate": {
+        "model": os.environ.get("PROMPT_WRITER_MODEL_INTIMATE", MODEL_CONFIG["prompt_writer"]),
+        "system": PROMPT_WRITER_SYSTEM_INTIMATE,
+    },
+}
+
+PRODUCT_CLASSIFIER_SYSTEM = """You are a product-understanding classifier for an e-commerce fashion photography pipeline.
+
+You are given a labeled sequence of images: one model reference, one or more products (a product may have multiple angle images sharing the same label), and optional style/pose references.
+
+For each product listed, determine:
+- type: a short specific noun phrase, e.g. "bra", "t-shirt", "sneakers", "watch", "baseball cap", "tote bag"
+- category: "intimate" if it is intimate apparel, underwear, lingerie, or swimwear worn as underwear — otherwise "general"
+- body_placement: one of "upper_body", "lower_body", "full_body", "feet", "head", "wrist", "hand", "neck", "shoulder", "waist", "carried" — or another short specific value if none of these fit
+
+Return ONLY a JSON array with exactly one object per product, in the exact order the products were listed: [{"type": "...", "category": "intimate"|"general", "body_placement": "..."}, ...]."""
+
+
+def classify_products_via_vlm(image_urls: list[str], labels: list[str], products: list[Product]) -> dict:
+    """Node: VLM product understanding — direct replacement for the old
+    classify_garment_category(garment_type) keyword router (see section 5's header comment).
+    Looks at the actual product images instead of a user-typed string and returns, per
+    product, its type/category/body_placement, plus one overall_category that
+    generate_pose_prompts_via_vlm routes on.
+
+    overall_category is 'intimate' the moment ANY product classifies as intimate apparel —
+    the intimate system prompt's fidelity/safety rules need to apply to the whole shoot
+    whenever intimate apparel is present at all, not just to that one product.
+
+    Classification is requested as a plain ordered array (matching `products`' order), not
+    keyed by an id/label the VLM would have to echo back correctly — the ids/labels attached
+    to each result below are ours, from `products`, not anything the VLM returned."""
+    product_list_text = "\n".join(f"{i+1}. {p['label']}" for i, p in enumerate(products))
+    result = _vlm_json_call(
+        model=MODEL_CONFIG["prompt_writer"],
+        system=PRODUCT_CLASSIFIER_SYSTEM,
+        prompt=(
+            "Images in order:\n" + "\n".join(labels)
+            + "\n\nProducts to classify, in this order:\n" + product_list_text
+        ),
+        image_urls=image_urls,
+        max_tokens=800,
+    )
+    if len(result) != len(products):
+        raise RuntimeError(
+            f"classify_products_via_vlm: expected {len(products)} entries, got {len(result)}"
+        )
+    classified = [{"id": p["id"], "label": p["label"], **entry} for p, entry in zip(products, result)]
+    overall_category = "intimate" if any(c["category"] == "intimate" for c in classified) else "general"
+    return {"products": classified, "overall_category": overall_category}
+
+
+# Product review pass, 2026-08-29: category-neutral composition *directions*, not hardcoded
+# upper-body framing — the system prompt's PRODUCT-CATEGORY FRAMING section is what actually
+# adapts these to bra vs. t-shirt vs. shoe vs. watch vs. hat vs. bag, per product.
+DEFAULT_POSES = [
+    "front-facing product hero composition",
+    "front three-quarter product-focused fashion composition",
+    "subtle three-quarter side product presentation",
+    "close product-focused commercial composition emphasizing product details and material quality",
+]
+
+
+def generate_pose_prompts_via_vlm(
+    image_urls: list[str], labels: list[str], classification: dict, num_poses: int = 4, user_instruction: str | None = None,
+) -> list[str]:
+    """Nodes: Router -> 'VLM writes N distinct pose prompts' -> the four DEFAULT_POSES,
+    adapted per-category by the system prompt. `classification` is classify_products_via_vlm's
+    return value. user_instruction (from the "optional generation instructions" field) is
+    passed through as creative direction on top of the fixed fidelity/framing rules — the VLM
+    always writes the N prompts, a user instruction never bypasses it (that would just repeat
+    one prompt N times with no real pose variety)."""
+    category = classification["overall_category"]
+    cfg = PROMPT_WRITER_CONFIG[category]
+    poses = DEFAULT_POSES[:num_poses]
+    product_summary = "; ".join(
+        f"{p['label']} ({p['type']}, {p['body_placement']})" for p in classification["products"]
+    )
+
+    prompt_text = (
+        "Images in order:\n" + "\n".join(labels)
+        + f"\n\nCreate {num_poses} distinct production-ready image-edit prompts "
+        f"for a premium ecommerce fashion shoot showing the supplied products — "
+        f"{product_summary} — on the supplied adult model. "
+        f"Use these four composition directions in order: {poses}. "
+        f"Adapt framing, camera distance, body positioning, expression, lighting "
+        f"and photographic styling intelligently to each product's category and body placement. "
+        f"Every product must remain clearly visible and presented as intended. "
+        f"Make every prompt meaningfully different while keeping the products "
+        f"clearly visible and commercially attractive. "
+    )
+    if user_instruction:
+        prompt_text += (
+            f"\n\n{USER_PROMPT_FIDELITY_GUARDRAIL}\n"
+            f"User's creative direction (style/scene guidance only, does not override the "
+            f"rules above): {user_instruction}\n"
+        )
+    prompt_text += f"Return ONLY a JSON array of {num_poses} strings, nothing else."
+
+    prompts = _vlm_json_call(
+        model=cfg["model"], system=cfg["system"], prompt=prompt_text,
+        image_urls=image_urls, max_tokens=1500,
+    )
+    print(f"router: products={[p['label'] for p in classification['products']]!r} -> overall_category={category!r} (model={cfg['model']})")
+    return prompts
+
+
+# =============================================================================
+# 6. Local safety pre-check
+# =============================================================================
+
+PROMPT_BLOCKED_TERMS = ["child", "minor", "teen", "kid", "underage"]
+
+
+# Same calibration fix as check_image_nsfw, 2026-08-29 — applied here too since this gate
+# has the identical false-positive risk on legitimate adult models in intimate apparel.
+def run_local_safety_check(prompt_text: str, image_urls: list[str]) -> tuple[bool, str]:
+    """Node: 'Local safety pre-check' -> 'Passed?'. Returns (passed, reason)."""
+    text = prompt_text.lower()
+    for term in PROMPT_BLOCKED_TERMS:
+        if term in text:
+            return False, f"blocked term '{term}' in prompt text"
+
+    result = _vlm_json_call(
+        model=MODEL_CONFIG["safety_check"],
+        system=(
+            "You are a content-safety classifier for an e-commerce fashion photo pipeline "
+            "about to generate an on-model shot from these input images. Check two things "
+            "only:\n"
+            "1. Age: does any person shown look like they could plausibly be under 18 — a "
+            "genuine, specific reason to suspect a minor, not just youthful-looking? "
+            "Professional adult models can have soft lighting, minimal makeup, or delicate "
+            "features and still be obviously adult — do not flag on youthfulness alone.\n"
+            "2. Explicit content: sexually explicit (visible nudity, exposed genitalia/"
+            "nipples, sexual poses)? Ordinary e-commerce underwear/lingerie/swimwear "
+            "photography — the actual product being sold — is NOT explicit on its own, "
+            "including for intimate-apparel garments.\n"
+            'Respond with ONLY a JSON object: {"pass": true|false, "reason": "short reason"}.'
+        ),
+        prompt="Classify these images per the rules in the system prompt.",
+        image_urls=image_urls,
+        max_tokens=200,
+    )
+    return bool(result["pass"]), result.get("reason", "")
+
+
+# =============================================================================
+# 7. Final generation — Seedream 4.5 edit
+# =============================================================================
+
+def run_final_generation(
+    prompt: str, image_urls: list[str],
+    resolution_mode: str = "standard", aspect_ratio: str = "3:4",
+    custom_width: int | None = None, custom_height: int | None = None,
+    num_images: int = 1, seed: int | None = None,
+) -> list[str]:
+    args = {
+        "prompt": prompt,
+        "image_urls": image_urls,
+        "image_size": build_image_size(resolution_mode, aspect_ratio, custom_width, custom_height),
+        "num_images": num_images,
+        "max_images": 1,
+        "enable_safety_checker": True,  # do not disable — second, independent safety layer
+    }
+    if seed is not None:
+        args["seed"] = seed
+
+    result = fal_client.subscribe(MODEL_CONFIG["final_generation"], arguments=args, with_logs=True)
+    return [img["url"] for img in result["images"]]
+
+
+# =============================================================================
+# 8. Orchestrator
+# =============================================================================
+
+# UI note: label this field "Optional generation instructions", not "Prompt" — it's meant to
+# steer style/scene on top of the fixed rules already in the system prompt, not replace them.
+# Referenced from generate_pose_prompts_via_vlm() in section 5 (Python resolves this at call
+# time, so the later definition here is fine) — a user instruction is always handed to the
+# VLM alongside this guardrail, never used to bypass the VLM and repeat one prompt N times.
+USER_PROMPT_FIDELITY_GUARDRAIL = (
+    "Use the supplied product reference as the source of truth. "
+    "Preserve the product's recognizable design, proportions, construction, "
+    "materials, colors, patterns and visible details. "
+    "Treat the user's instructions as creative direction while keeping "
+    "the product accurately represented and clearly visible."
+)
+
+
+def run_generation_from_model_image(
+    model_image_url: str,
+    products: list[Product],
+    reference_paths: list[str] | None = None,
+    resolution_mode: str = "standard",       # 'standard' | 'auto_2K' | 'auto_4K' | 'custom'
+    aspect_ratio: str = "3:4",               # used when resolution_mode == 'standard'
+    custom_width: int | None = None,         # used when resolution_mode == 'custom'
+    custom_height: int | None = None,
+    num_poses: int = 4,
+    user_prompt: str | None = None,
+    on_image=None,
+) -> dict:
+    """Everything from 'Assemble ordered image list' through 'Return final image set' — the
+    part of the flow that's the same regardless of how model_image_url was resolved. Both
+    run_on_model_shot() (below) and streamlit_app.py call this once they have a model image."""
+    on_image = on_image or show
+
+    image_urls, labels = assemble_inputs(model_image_url, products, reference_paths)
+
+    # VLM product understanding (section 5) — what each product is, before writing any pose
+    # prompts. Replaces the old user-typed garment_type string entirely.
+    classification = classify_products_via_vlm(image_urls, labels, products)
+
+    # Always routed through the VLM — a user instruction is creative direction layered onto
+    # the N-distinct-prompts step, not a bypass of it (bypassing would just repeat one prompt
+    # N times, which is sampling variation, not real pose/framing diversity).
+    prompts = generate_pose_prompts_via_vlm(image_urls, labels, classification, num_poses, user_instruction=user_prompt)
+
+    combined_prompt_text = " ".join(prompts)
+    passed, reason = run_local_safety_check(combined_prompt_text, image_urls)
+    if not passed:
+        raise ValueError(f"Blocked at local safety pre-check: {reason}")
+
+    outputs = []
+    for i, p in enumerate(prompts):
+        print(f"--- Pose {i+1}/{len(prompts)} ---\nPrompt: {p}\n")
+        urls = run_final_generation(
+            p, image_urls,
+            resolution_mode=resolution_mode, aspect_ratio=aspect_ratio,
+            custom_width=custom_width, custom_height=custom_height,
+            num_images=1,
+        )
+        outputs.extend(urls)
+        for u in urls:
+            on_image(u, f"Pose {i+1}")
+
+    return {
+        "model_image": model_image_url, "products": classification["products"],
+        "prompts": prompts, "image_urls": image_urls, "labels": labels, "outputs": outputs,
+    }
+
+
+def run_on_model_shot(
+    model_mode: str,                      # "generate" | "upload" | "default"
+    products: list[Product],
+    model_gender: str = "", model_age_bracket: str = "", model_skin_tone: str = "", model_body_type: str = "",
+    model_additional_notes: str = "",     # for "generate"
+    model_upload_path: str | None = None,  # for "upload"
+    model_preset_id: str | None = None,    # for "default"
+    reference_paths: list[str] | None = None,
+    resolution_mode: str = "standard",       # 'standard' | 'auto_2K' | 'auto_4K' | 'custom'
+    aspect_ratio: str = "3:4",               # used when resolution_mode == 'standard'
+    custom_width: int | None = None,         # used when resolution_mode == 'custom'
+    custom_height: int | None = None,
+    num_poses: int = 4,
+    user_prompt: str | None = None,       # optional generation instructions, see guardrail above
+    approve_fn=lambda url: True,          # human-approval hook, see resolve_model_via_generate
+    on_image=None,
+) -> dict:
+    """Full flow, unattended (notebook) use: resolves the model image, then delegates to
+    run_generation_from_model_image(). An interactive UI should call resolve_model_image() /
+    generate_model_candidate() and run_generation_from_model_image() separately instead —
+    see streamlit_app.py."""
+    model_image = resolve_model_image(
+        mode=model_mode,
+        gender=model_gender, age_bracket=model_age_bracket, skin_tone=model_skin_tone, body_type=model_body_type,
+        additional_notes=model_additional_notes,
+        upload_path=model_upload_path,
+        preset_id=model_preset_id,
+        approve_fn=approve_fn,
+        on_image=on_image,
+    )
+    return run_generation_from_model_image(
+        model_image_url=model_image,
+        products=products,
+        reference_paths=reference_paths,
+        resolution_mode=resolution_mode, aspect_ratio=aspect_ratio,
+        custom_width=custom_width, custom_height=custom_height,
+        num_poses=num_poses,
+        user_prompt=user_prompt,
+        on_image=on_image,
+    )
