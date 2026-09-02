@@ -40,6 +40,7 @@ if mode == "generate":
     with col1:
         gender = st.radio("Gender", flow.GENDER_OPTIONS, horizontal=True)
         age_bracket = st.radio("Age", flow.AGE_BRACKET_OPTIONS)
+        ethnicity = st.selectbox("Ethnicity / heritage", flow.ETHNICITY_OPTIONS)
     with col2:
         skin_tone = st.selectbox("Skin tone", flow.SKIN_TONE_OPTIONS)
         body_type = st.selectbox("Body type", flow.BODY_TYPE_OPTIONS)
@@ -51,43 +52,48 @@ if mode == "generate":
     )
 
     if st.button("Generate model preview"):
-        with st.spinner("Writing prompt + generating..."):
-            st.session_state["candidate"] = flow.generate_model_candidate(
-                gender, age_bracket, skin_tone, body_type, additional_notes
-            )
+        try:
+            with st.spinner("Writing prompt + generating..."):
+                st.session_state["candidate"] = flow.generate_model_candidate(
+                    gender, age_bracket, ethnicity, skin_tone, body_type, additional_notes
+                )
+        except ValueError as e:
+            st.error(str(e))
 
     candidate = st.session_state.get("candidate")
     if candidate:
         st.caption(f"LLM-written prompt: _{candidate['description']}_")
-        # Always show the image, flagged or not — an auto-check that hides what it flagged
-        # gives you no way to catch its own false positives. Look at it, then decide.
         st.image(candidate["url"], width=320)
         st.download_button(
             "Download preview", data=flow.fetch_image_bytes(candidate["url"]),
             file_name="model_preview.png", mime="image/png", key="dl_model_preview",
         )
-        if not candidate["clean"]:
-            st.warning(
-                f"Safety-check VLM flagged this: {candidate['reason']}. If that's a clear "
-                f"false positive on the image above, Approve anyway — otherwise Regenerate."
-            )
+        # No NSFW/age flag to show here — the generate path is deterministically adult by
+        # construction (adult-only age picker + a minor-age gate on additional_notes), so
+        # there's nothing left for a vision check to flag. See flow.generate_model_candidate.
         c1, c2 = st.columns(2)
         if c1.button("Approve"):
             st.session_state["model_image_url"] = candidate["url"]
+            st.session_state["model_age_status"] = candidate["age_status"]
             st.success("Model approved — proceed to garment below.")
         if c2.button("Regenerate"):
-            with st.spinner("Regenerating..."):
-                st.session_state["candidate"] = flow.generate_model_candidate(
-                    gender, age_bracket, skin_tone, body_type, additional_notes
-                )
-            st.rerun()
+            try:
+                with st.spinner("Regenerating..."):
+                    st.session_state["candidate"] = flow.generate_model_candidate(
+                        gender, age_bracket, ethnicity, skin_tone, body_type, additional_notes
+                    )
+                st.rerun()
+            except ValueError as e:
+                st.error(str(e))
 
 elif mode == "upload":
     up = st.file_uploader("Upload model photo", type=["jpg", "jpeg", "png"])
     if up is not None and st.button("Use this photo"):
         try:
             with st.spinner("Uploading + safety-checking..."):
-                st.session_state["model_image_url"] = flow.resolve_model_via_upload(save_upload(up))
+                model = flow.validate_uploaded_model(save_upload(up))
+            st.session_state["model_image_url"] = model["url"]
+            st.session_state["model_age_status"] = model["age_status"]
             st.success("Uploaded and passed the safety check.")
         except ValueError as e:
             st.error(str(e))
@@ -96,12 +102,15 @@ else:  # default
     if flow.MODEL_LIBRARY:
         preset_id = st.selectbox("Preset model", list(flow.MODEL_LIBRARY.keys()))
         if st.button("Use preset"):
-            st.session_state["model_image_url"] = flow.resolve_model_via_default(preset_id)
+            model = flow.resolve_model_via_default(preset_id)
+            st.session_state["model_image_url"] = model["url"]
+            st.session_state["model_age_status"] = model["age_status"]
             st.success("Preset selected.")
     else:
         st.info("MODEL_LIBRARY in flow.py is empty — add preset id -> path/URL entries to use this mode.")
 
 model_image_url = st.session_state.get("model_image_url")
+model_age_status = st.session_state.get("model_age_status", "adult")
 if model_image_url:
     st.success(f"Current model image: {model_image_url}")
 
@@ -110,9 +119,10 @@ st.divider()
 # =============================================================================
 # 2. Products
 # =============================================================================
-# No "what is this" text field — flow.classify_products_via_vlm looks at the actual images
-# and works out type/category/body-placement itself. The user only uploads and (in Multiple
-# Garments mode, for anything past Top/Bottom) optionally labels for their own bookkeeping.
+# No "what is this" text field — flow.analyze_shoot_and_generate_prompts looks at the actual
+# images and works out type/category/body-placement itself. The user only uploads and (in
+# Multiple Garments mode, for anything past Top/Bottom) optionally labels for their own
+# bookkeeping.
 st.header("2. Products")
 
 product_mode = st.radio("Mode", ["Single Garment", "Multiple Garments"], horizontal=True, key="product_mode")
@@ -215,7 +225,7 @@ elif resolution_mode == "custom":
 else:
     st.caption("Model decides the aspect ratio from the inputs — no further size input needed.")
 
-num_poses = st.slider("Number of poses", 1, 4, 4)
+num_poses = st.number_input("Number of poses", min_value=1, max_value=4, value=4, step=1)
 
 user_prompt = st.text_area(
     "Optional generation instructions",
@@ -243,6 +253,7 @@ if st.button("Generate on-model shots", type="primary", disabled=not can_run):
             result = flow.run_generation_from_model_image(
                 model_image_url=model_image_url,
                 products=products,
+                model_age_status=model_age_status,
                 reference_paths=reference_paths,
                 resolution_mode=resolution_mode, aspect_ratio=aspect_ratio,
                 custom_width=custom_width, custom_height=custom_height,

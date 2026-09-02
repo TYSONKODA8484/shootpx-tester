@@ -117,7 +117,7 @@ def _extract_json_text(text: str) -> str:
 def _vlm_json_call(model: str, system: str, prompt: str, image_urls: list[str] | None = None, max_tokens: int = 1000) -> dict:
     """One call through fal's `openrouter/router/vision` (MODEL_CONFIG['vlm_endpoint']) —
     `model` picks the underlying model. Works with or without images (image_urls=None is a
-    plain text LLM call, used by generate_model_prompt_via_llm below). `reasoning: True` is
+    plain text LLM call, used by generate_model_prompt_and_validate below). `reasoning: True` is
     mandatory for some models on this endpoint (confirmed, 2026-08-29: gemini-3.1-pro-preview
     400s without it — "Reasoning is mandatory for this endpoint and cannot be disabled") —
     sent unconditionally, since non-reasoning models just ignore it. Must return a bare JSON
@@ -161,7 +161,31 @@ MODEL_LIBRARY = {
     "preset_2": "assets/models/preset_2.jpg",
 }
 
-DESCRIPTION_BLOCKED_TERMS = ["child", "minor", "teen", "kid", "underage"]
+# Deterministic minor-age blocklist — used on: (a) the "generate" path's additional_notes, so
+# free text can never override the adult-only structured picker (e.g. age="25-30" + notes="make
+# her look 10" must still block); (b) the user's free-text generation instructions, alongside
+# NSFW_BLOCKED_TERMS below (see section 6). Phrasing, not just single words, since "10 year old"
+# and "under 18" are the actual real-world attack shapes, not just the word "child" in isolation.
+MINOR_AGE_BLOCKED_PATTERNS = [
+    "child", "minor", "teen", "kid", "toddler", "baby", "underage", "under 18", "under-18",
+    "under age", "schoolgirl", "school girl", "schoolboy", "school boy",
+]
+MINOR_AGE_NUMBER_RE = re.compile(r"\b(\d{1,2})\s*[-\s]?year", re.IGNORECASE)
+
+
+def check_text_for_minor_age(text: str) -> None:
+    """Deterministic gate — no VLM. Raises ValueError if `text` implies a minor/underage
+    subject, by keyword/phrase match or by an explicit age number under 18 (e.g. "10 year old",
+    "16-year-old"). Used to stop free text (additional_notes, user_prompt) from describing a
+    minor even when a structured picker elsewhere is adult-only — the picker being adult-only
+    does not stop someone typing an age into a text field."""
+    lowered = text.lower()
+    for phrase in MINOR_AGE_BLOCKED_PATTERNS:
+        if phrase in lowered:
+            raise ValueError(f"Blocked: text implies a minor/underage subject ('{phrase}').")
+    for match in MINOR_AGE_NUMBER_RE.finditer(lowered):
+        if int(match.group(1)) < 18:
+            raise ValueError(f"Blocked: text specifies an age under 18 ('{match.group(0)}').")
 
 # Structured-picker options for the "generate" path. Deliberately adult-only — no "children"/
 # "youth" bracket, unlike a typical reference UI — this has to stay consistent with the nsfw/
@@ -172,6 +196,7 @@ GENDER_OPTIONS = ["Female", "Male"]
 # safety-check VLM correctly flagged the result as looking underage. Starting the range at
 # 25 gives real headroom before the ambiguous-age zone.
 AGE_BRACKET_OPTIONS = ["Young adult (25-30)", "Adult (30s-40s)", "Mature adult (50+)"]
+ETHNICITY_OPTIONS = ["South Asian", "East Asian", "Southeast Asian", "Middle Eastern", "Black", "Hispanic/Latino", "White/Caucasian", "Mixed/Other"]
 SKIN_TONE_OPTIONS = ["Fair", "Light", "Tan", "Deep"]
 BODY_TYPE_OPTIONS = ["Slim", "Athletic", "Average", "Curvy", "Plus size"]
 
@@ -179,9 +204,27 @@ BODY_TYPE_OPTIONS = ["Slim", "Athletic", "Average", "Curvy", "Plus size"]
 # an image the safety-check VLM flagged as looking underage — passing the age bracket through
 # as a bare label doesn't push the image model toward unambiguous adult features. Now
 # explicitly instructed to describe visual maturity signals, not just state a number.
-MODEL_PROMPT_WRITER_SYSTEM = """You write a single, vivid, photorealistic text-to-image prompt describing a human model for a professional ecommerce fashion photography studio portrait.
+#
+# Architecture, 2026-09-03: "one Gemini request should perform every logically related Gemini
+# job that can be safely combined" — this used to be two calls (write the prompt, then a
+# separate VLM call to check additional_notes for unsafe intent). Now it's one call that does
+# both: judges additional_notes for unsafe/inappropriate intent AND writes the model prompt in
+# the same response — never both prompt-writing AND safety-judgment as separate round trips for
+# the same input. The deterministic check_text_for_minor_age keyword/regex gate still runs
+# BEFORE this call (see generate_model_prompt_and_validate below) as a free pre-filter for the
+# obvious cases; this system prompt's "allowed" judgment is a second, independent layer for
+# subtler phrasing that pre-filter can't catch — and per section 6's rule ("AI can classify,
+# code makes the final business decision"), the caller still enforces "allowed" in Python, it is
+# never trusted blindly.
+MODEL_PROMPT_WRITER_SYSTEM = """You have two jobs in one response for an e-commerce fashion photography studio: (1) judge whether the user's additional notes are safe to act on, and (2) if safe, write the text-to-image prompt.
 
-Given structured attributes and optional additional notes, write ONE descriptive paragraph (not a list) that a text-to-image model can use directly: appearance, studio setting, neutral standing pose, lighting, photographic quality.
+JOB 1 — SAFETY JUDGMENT:
+Given the structured attributes and the user's additional notes (if any), decide "allowed": false if the additional notes imply, even subtly or indirectly, an underage/age-ambiguous subject, or sexually explicit/inappropriate content. Ordinary style/appearance notes (hair, expression, lighting, setting) are always "allowed": true.
+
+JOB 2 — PROMPT WRITING (only if allowed is true):
+Write a single, vivid, photorealistic text-to-image prompt describing a human model for a professional ecommerce fashion photography studio portrait.
+
+Given structured attributes (including gender, age bracket, ethnicity/heritage, skin tone and body type) and optional additional notes, write ONE descriptive paragraph (not a list) that a text-to-image model can use directly: appearance, studio setting, neutral standing pose, lighting, photographic quality. Reflect the requested ethnicity/heritage naturally and respectfully in the described facial features and styling, consistent with the requested skin tone.
 
 The model should be attractive, photogenic and camera-ready the way a professional fashion catalog model is: polished, well-groomed, confident, flattering studio lighting, a genuine and warm expression. That is the actual point of this step — produce a good-looking model a fashion brand would want to use, not just a technically compliant photo.
 
@@ -189,17 +232,21 @@ The model must also read as unmistakably an adult — mature, fully developed ad
 
 Being attractive and being unambiguously adult are not in tension: professional fashion models are typically confident adults in their mid-20s to 30s — describe exactly that standard, not a compromise between "attractive" and "adult."
 
-Return only the requested JSON structure."""
+Return ONLY a JSON object: {"allowed": true|false, "reason": "<short reason, empty string if allowed>", "prompt": "<the single descriptive paragraph, empty string if not allowed>"}."""
 
 
-def generate_model_prompt_via_llm(gender: str, age_bracket: str, skin_tone: str, body_type: str, additional_notes: str = "") -> str:
-    """Node: feeds 'Structured picker' + 'Optional free-text refinement' into the LLM instead
-    of asking the user to write the text-to-image prompt themselves."""
-    attrs = {"gender": gender, "age_bracket": age_bracket, "skin_tone": skin_tone, "body_type": body_type}
+def generate_model_prompt_and_validate(gender: str, age_bracket: str, ethnicity: str, skin_tone: str, body_type: str, additional_notes: str = "") -> dict:
+    """Node: feeds 'Structured picker' + 'Optional free-text refinement' into ONE Gemini call
+    that both judges additional_notes for unsafe intent AND writes the text-to-image prompt —
+    replaces the old generate_model_prompt_via_llm() + a separate notes-safety VLM check.
+    Returns {"allowed": bool, "reason": str, "prompt": str}. Caller (generate_model_candidate)
+    still enforces "allowed" itself — this function never raises on an unsafe judgment, it only
+    reports it, per section 6's "AI can classify, code makes the final business decision"."""
+    attrs = {"gender": gender, "age_bracket": age_bracket, "ethnicity": ethnicity, "skin_tone": skin_tone, "body_type": body_type}
     prompt_text = (
         "Structured attributes: " + json.dumps(attrs)
         + (f"\nAdditional notes from user: {additional_notes}" if additional_notes else "")
-        + '\n\nReturn ONLY a JSON object: {"prompt": "<the single descriptive paragraph>"}.'
+        + '\n\nReturn ONLY the requested JSON object.'
     )
     result = _vlm_json_call(
         # max_tokens=800, not 300: PROMPT_WRITER_MODEL is a reasoning-mandatory model (see
@@ -210,41 +257,27 @@ def generate_model_prompt_via_llm(gender: str, age_bracket: str, skin_tone: str,
         model=MODEL_CONFIG["prompt_writer"], system=MODEL_PROMPT_WRITER_SYSTEM,
         prompt=prompt_text, image_urls=None, max_tokens=800,
     )
-    return result["prompt"]
+    return {
+        "allowed": bool(result.get("allowed", True)),
+        "reason": result.get("reason", ""),
+        "prompt": result.get("prompt", ""),
+    }
 
 
-def check_description_safety(description: str):
-    """Node: '1st safety layer', pass 1 — near-free keyword blocklist, before any paid
-    generation call happens. Catches the obvious cases instantly."""
-    text = description.lower()
-    for term in DESCRIPTION_BLOCKED_TERMS:
-        if term in text:
-            raise ValueError(f"Blocked term '{term}' in model description — request not sent.")
-    return True
-
-
-def check_description_safety_llm(description: str) -> tuple[bool, str]:
-    """Node: '1st safety layer', pass 2 — one cheap text-only LLM call (no image, so far
-    cheaper than a generation call) that catches what the keyword blocklist can't: subtler
-    phrasing implying an underage or otherwise unsafe subject. Runs before the paid
-    text-to-image call, same spot check_description_safety runs — the goal is rejecting a
-    bad request before spending on generation, not after. This does NOT replace
-    check_image_nsfw: a clean-sounding description can still render an ambiguous-looking
-    face, which only inspecting the actual output image can catch."""
-    result = _vlm_json_call(
-        model=MODEL_CONFIG["safety_check"],
-        system=(
-            "You are a strict content-safety classifier for an e-commerce fashion photo "
-            "pipeline, reviewing a text-to-image PROMPT before it is sent for generation "
-            "(no image exists yet). Reject it if it implies, even subtly or indirectly, an "
-            "underage or age-ambiguous subject, or sexually explicit/inappropriate content. "
-            'Respond with ONLY a JSON object: {"pass": true|false, "reason": "short reason"}.'
-        ),
-        prompt=f"Model description: {description}",
-        image_urls=None,
-        max_tokens=150,
-    )
-    return bool(result["pass"]), result.get("reason", "")
+# Architecture, 2026-09-03 (see the "child + intimate garment" design discussion): safety now
+# happens at the point where the relevant information becomes known, not "VLM at every stage".
+# The generate path's age is a deterministic, adult-only structured picker (AGE_BRACKET_OPTIONS)
+# — free text (additional_notes) must never be able to override that into a minor. That's a
+# deterministic keyword/phrase check (check_text_for_minor_age above), not a VLM call: it's not
+# ambiguous natural language needing interpretation, it's specific blocked phrasing/ages. No
+# separate image-NSFW check runs on the generated model image any more — a generated model is
+# always age_status="adult" once its notes pass this gate, because the picker never offers a
+# minor option and the notes can't smuggle one in.
+def validate_generate_notes(additional_notes: str) -> None:
+    """Node: 'generate' path's only safety gate, pass-or-raise. Runs before the paid
+    text-to-image call. Raises ValueError if additional_notes implies a minor."""
+    if additional_notes:
+        check_text_for_minor_age(additional_notes)
 
 
 # Calibration fix, 2026-08-29: an actually-fine adult model (loungewear, ordinary studio
@@ -254,29 +287,42 @@ def check_description_safety_llm(description: str) -> tuple[bool, str]:
 # Recalibrated to require a specific, real reason to suspect a minor, and to explicitly say
 # normal underwear/lingerie e-commerce photography isn't inherently "explicit" — this is a
 # bra/underwear business, that content is the product, not a violation.
-def check_image_nsfw(image_url: str) -> tuple[bool, str]:
-    """Node: 'Check for nsfw image' / 'Check generated image for nsfw'. VLM-based —
-    model is MODEL_CONFIG['safety_check'], swap it there. Returns (is_clean, reason)."""
+#
+# This is now ONLY used on the "upload" path (see validate_uploaded_model below) — an arbitrary
+# user-supplied photo is the one case the app doesn't control the contents of, so it's the one
+# case that actually needs a vision check. Presets are pre-vetted; generated models are age-
+# gated deterministically above. Returns age_status so the caller can feed the later
+# child+intimate-product gate, not just a clean/not-clean bool.
+def check_image_nsfw(image_url: str) -> dict:
+    """Node: 'Check for nsfw image' (upload path only). VLM-based — model is
+    MODEL_CONFIG['safety_check'], swap it there. Returns {"clean": bool, "age_status":
+    "adult"|"minor"|"uncertain", "reason": str}."""
     result = _vlm_json_call(
         model=MODEL_CONFIG["safety_check"],
         system=(
             "You are a content-safety classifier for an e-commerce fashion photo pipeline. "
             "Given one image, check two things only:\n"
-            "1. Age: does the person look like they could plausibly be under 18 — not just "
-            "youthful-looking, but a genuine, specific reason to suspect a minor? Professional "
-            "adult models often have soft studio lighting, natural/minimal makeup, or delicate "
-            "features and are still obviously adult. Do NOT flag on youthfulness alone — only "
-            "flag with a real, articulable reason.\n"
+            "1. Age: classify the person as \"adult\" (unmistakably 18+), \"minor\" (a "
+            "genuine, specific reason to suspect under 18 — not just youthful-looking), or "
+            "\"uncertain\" (genuinely cannot tell). Professional adult models often have soft "
+            "studio lighting, natural/minimal makeup, or delicate features and are still "
+            "obviously adult — do NOT classify as minor or uncertain on youthfulness alone, "
+            "only with a real, articulable reason.\n"
             "2. Explicit content: is the image sexually explicit (visible nudity, exposed "
             "genitalia/nipples, sexual acts or poses)? Ordinary e-commerce underwear/lingerie/"
             "swimwear photography — the actual product being sold — is NOT explicit on its own.\n"
-            'Respond with ONLY a JSON object: {"clean": true|false, "reason": "short reason"}.'
+            'Respond with ONLY a JSON object: {"clean": true|false, "age_status": '
+            '"adult"|"minor"|"uncertain", "reason": "short reason"}.'
         ),
         prompt="Classify this image per the rules in the system prompt.",
         image_urls=[image_url],
         max_tokens=200,
     )
-    return bool(result["clean"]), result.get("reason", "")
+    return {
+        "clean": bool(result["clean"]),
+        "age_status": result.get("age_status", "uncertain"),
+        "reason": result.get("reason", ""),
+    }
 
 
 def generate_model_via_text2image(description: str, image_size: str = "portrait_4_3") -> str:
@@ -289,84 +335,88 @@ def generate_model_via_text2image(description: str, image_size: str = "portrait_
     return result["images"][0]["url"]
 
 
-def generate_model_candidate(gender: str, age_bracket: str, skin_tone: str, body_type: str, additional_notes: str = "") -> dict:
-    """One full attempt: LLM writes the prompt -> hard-check the description (keyword, then
-    LLM) -> text-to-image -> nsfw-check the result. The two description checks run BEFORE the
-    paid text-to-image call, so an obviously bad request never reaches it. The image check
-    does NOT raise on a flag — the caller (UI) decides whether to show an error, auto-retry,
-    or let a human override an obvious false positive after actually looking at the image.
-    This is the single-attempt building block; resolve_model_via_generate below loops it for
-    unattended use, and streamlit_app.py calls it directly per button click for interactive
-    approve/regenerate."""
-    description = generate_model_prompt_via_llm(gender, age_bracket, skin_tone, body_type, additional_notes)
-    check_description_safety(description)
-    passed, reason = check_description_safety_llm(description)
-    if not passed:
-        raise ValueError(f"Blocked at prompt-level safety check: {reason}")
-    url = generate_model_via_text2image(description)
-    clean, reason = check_image_nsfw(url)
-    return {"url": url, "clean": clean, "reason": reason, "description": description}
+def generate_model_candidate(gender: str, age_bracket: str, ethnicity: str, skin_tone: str, body_type: str, additional_notes: str = "") -> dict:
+    """One full attempt: deterministic minor-age pre-filter on additional_notes (free, catches
+    the obvious cases before spending a Gemini call) -> ONE combined Gemini call that judges
+    the notes AND writes the prompt (generate_model_prompt_and_validate) -> text-to-image.
+    "allowed" from Gemini is enforced here in Python, not trusted blindly (section 6's "AI can
+    classify, code makes the final business decision") — a False raises just like the
+    deterministic pre-filter does, so both layers actually block, neither just advises.
+    No image-NSFW/age vision check on the result — the generate path is deterministically adult
+    by construction (AGE_BRACKET_OPTIONS is adult-only and both safety layers above already stop
+    additional_notes from smuggling in a minor), so there is nothing left for a vision check to
+    catch that these gates didn't already catch. age_status is always "adult" here. This is the
+    single-attempt building block; resolve_model_via_generate below loops it for unattended use,
+    and streamlit_app.py calls it directly per button click for interactive approve/regenerate.
+    """
+    validate_generate_notes(additional_notes)
+    result = generate_model_prompt_and_validate(gender, age_bracket, ethnicity, skin_tone, body_type, additional_notes)
+    if not result["allowed"]:
+        raise ValueError(f"Blocked at prompt-level safety check: {result['reason']}")
+    url = generate_model_via_text2image(result["prompt"])
+    return {"url": url, "age_status": "adult", "description": result["prompt"]}
 
 
 def resolve_model_via_generate(
-    gender: str, age_bracket: str, skin_tone: str, body_type: str,
+    gender: str, age_bracket: str, ethnicity: str, skin_tone: str, body_type: str,
     additional_notes: str = "", approve_fn=lambda url: True, on_image=None, max_attempts: int = 3,
-) -> str:
-    """Nodes: structured picker -> free-text refinement -> 1st safety layer -> Text-to-Image
-    call -> nsfw check -> preview -> Approve?. Loops on a failed nsfw check or a
-    'No, regenerate' from approve_fn, up to max_attempts. Unattended/notebook use — for an
-    interactive UI, call generate_model_candidate() per button click instead (see
-    streamlit_app.py) since a real approve/regenerate loop needs UI state between attempts,
-    not a blocking Python loop.
+) -> dict:
+    """Nodes: structured picker -> free-text refinement -> minor-age gate -> Text-to-Image
+    call -> preview -> Approve?. Loops on a 'No, regenerate' from approve_fn, up to
+    max_attempts (no nsfw-retry loop any more — see generate_model_candidate). Unattended/
+    notebook use — for an interactive UI, call generate_model_candidate() per button click
+    instead (see streamlit_app.py) since a real approve/regenerate loop needs UI state between
+    attempts, not a blocking Python loop.
 
     approve_fn(url) -> bool is the human-approval hook; defaults to auto-approve so this runs
     unattended in a notebook. on_image(url, caption) renders each preview; defaults to show().
+    Returns {"url": ..., "age_status": "adult"}.
     """
     on_image = on_image or show
     for attempt in range(1, max_attempts + 1):
-        candidate = generate_model_candidate(gender, age_bracket, skin_tone, body_type, additional_notes)
-        if not candidate["clean"]:
-            print(f"[attempt {attempt}] generated image flagged nsfw ({candidate['reason']}) — regenerating")
-            continue
+        candidate = generate_model_candidate(gender, age_bracket, ethnicity, skin_tone, body_type, additional_notes)
         on_image(candidate["url"], f"Preview — attempt {attempt}")
         if approve_fn(candidate["url"]):
-            return candidate["url"]  # -> 'Save as Model Library asset' happens at the caller if desired
+            return {"url": candidate["url"], "age_status": candidate["age_status"]}
         print(f"[attempt {attempt}] not approved — regenerating")
 
-    raise RuntimeError(f"Could not produce an approved, clean model image in {max_attempts} attempts.")
+    raise RuntimeError(f"Could not produce an approved model image in {max_attempts} attempts.")
 
 
-def resolve_model_via_upload(path_or_url: str) -> str:
-    """Nodes: Upload Model -> Check for nsfw image -> Upload to hosted storage.
-    An NSFW upload can't be regenerated — raise and let the caller ask for a different file
-    ('If NSFW' loops back to Model Source? in the diagram)."""
+def validate_uploaded_model(path_or_url: str) -> dict:
+    """Nodes: Upload Model -> Check for nsfw image -> Upload to hosted storage. The one model
+    source the app doesn't control the contents of, so it's the one that needs a real vision
+    check — for age status (feeds the later child+intimate-product gate) and NSFW. An NSFW
+    upload can't be regenerated — raise and let the caller ask for a different file ('If NSFW'
+    loops back to Model Source? in the diagram). Returns {"url": ..., "age_status": ...}."""
     hosted_url = to_hosted_url(path_or_url)
-    clean, reason = check_image_nsfw(hosted_url)
-    if not clean:
-        raise ValueError(f"Uploaded model image flagged nsfw ({reason}) — please upload a different photo.")
-    return hosted_url
+    result = check_image_nsfw(hosted_url)
+    if not result["clean"]:
+        raise ValueError(f"Uploaded model image flagged nsfw ({result['reason']}) — please upload a different photo.")
+    return {"url": hosted_url, "age_status": result["age_status"]}
 
 
-def resolve_model_via_default(preset_id: str) -> str:
-    """Node: Pick from Model Library — presets are pre-vetted, no nsfw check needed."""
-    return to_hosted_url(MODEL_LIBRARY[preset_id])
+def resolve_model_via_default(preset_id: str) -> dict:
+    """Node: Pick from Model Library — presets are pre-vetted trusted assets: no nsfw/age check,
+    always age_status="adult"."""
+    return {"url": to_hosted_url(MODEL_LIBRARY[preset_id]), "age_status": "adult"}
 
 
 def resolve_model_image(
     mode: str,
-    gender: str = "", age_bracket: str = "", skin_tone: str = "", body_type: str = "",
+    gender: str = "", age_bracket: str = "", ethnicity: str = "", skin_tone: str = "", body_type: str = "",
     additional_notes: str = "",
     upload_path: str | None = None,
     preset_id: str | None = None,
     approve_fn=lambda url: True,
     on_image=None,
-) -> str:
+) -> dict:
     """mode: 'generate' | 'upload' | 'default' — dispatches to the three branches above and
-    returns model_image_url."""
+    returns {"url": model_image_url, "age_status": "adult"|"minor"|"uncertain"}."""
     if mode == "generate":
-        return resolve_model_via_generate(gender, age_bracket, skin_tone, body_type, additional_notes, approve_fn, on_image)
+        return resolve_model_via_generate(gender, age_bracket, ethnicity, skin_tone, body_type, additional_notes, approve_fn, on_image)
     if mode == "upload":
-        return resolve_model_via_upload(upload_path)
+        return validate_uploaded_model(upload_path)
     if mode == "default":
         return resolve_model_via_default(preset_id)
     raise ValueError(f"Unknown model mode: {mode}")
@@ -425,16 +475,16 @@ def assemble_inputs(model_image: str, products: list[Product], reference_images:
         )
 
     urls = [model_image]
-    labels = ["Image 1 = model reference"]
+    labels = ["#Image1 = model reference"]
     for product in products:
         n = len(product["image_paths"])
         for i, path in enumerate(product["image_paths"], start=1):
             urls.append(path)
             angle = f" ({i}/{n})" if n > 1 else ""
-            labels.append(f"Image {len(labels)+1} = product '{product['label']}'{angle}, exact product, preserve fidelity")
+            labels.append(f"#Image{len(labels)+1} = product '{product['label']}'{angle}, exact product, preserve fidelity")
     for r in reference_images:
         urls.append(r)
-        labels.append(f"Image {len(labels)+1} = style/pose reference only")
+        labels.append(f"#Image{len(labels)+1} = style/pose reference only")
 
     image_urls = [to_hosted_url(u) for u in urls]
     return image_urls, labels
@@ -498,30 +548,58 @@ def build_image_size(resolution_mode: str = "standard", aspect_ratio: str = "3:4
 
 
 # =============================================================================
-# 5. Product understanding + router + prompt logic
+# 5. Product understanding + user-instruction safety + pose-prompt writing — ONE Gemini call
 # =============================================================================
-# Node: 'Router: garment category -> intimate or general' -> picks the system prompt. Used to
-# be a keyword classifier on a user-typed garment_type string; now it's a VLM call over the
-# actual product images (see section 3's docstring for why) — the user never tells us what a
-# product is, the model looks at it.
-
+# Architecture, 2026-09-03: "one Gemini request should perform every logically related Gemini
+# job that can be safely combined." This used to be three separate calls: classify_products_via_vlm
+# (product type/category/body_placement) -> a user-instruction-safety VLM escalation -> then
+# generate_pose_prompts_via_vlm (N pose prompts, using whichever system prompt the classification
+# picked). That ordering is now impossible to keep as separate calls without ALSO merging them,
+# because a merged call can't know the category before it runs (chicken-and-egg: category picks
+# the system prompt, but classification is now part of what that one call does) — so instead of
+# two system prompts (GENERAL/INTIMATE) selected AFTER classification, there is now ONE unified
+# system prompt that includes classification instructions, both rule sets, AND pose-writing, and
+# Gemini self-applies the intimate-specific fidelity/safety rules only to the products it
+# classifies as intimate. See the "Merge B" design discussion, 2026-09-03, for why this shape was
+# chosen over keeping classification as a separate first call.
+#
+# The deterministic Python gates around this call are UNCHANGED and still authoritative:
+# check_model_product_compatibility (child+intimate block) still runs on this call's own
+# overall_category output, in Python, after the call returns — Gemini reports the category,
+# Python still makes the final business decision (section 6). Likewise check_user_text_safety's
+# deterministic keyword pass still runs on the raw user_prompt BEFORE this call, for the same
+# "free pre-filter first" reason as generate_model_candidate above; this call's
+# user_instruction_safe is a second, independent layer for subtler phrasing, not a replacement.
 
 # Product review pass, 2026-08-29: shifted from a short imperative-checklist prompt to a full
 # creative-director brief — the goal is attractive, commercially usable output across every
 # product category (bra, t-shirt, pants, shoes, hats, watches, bags, ...), not sterile catalog
 # shots. PRODUCT-CATEGORY FRAMING tells the VLM to adapt composition per category itself
 # (e.g. show a hand for a watch, a leg for a shoe, half/full body when the product needs it)
-# rather than us hardcoding a framing rule per category.
-PROMPT_WRITER_SYSTEM_GENERAL = """You are the creative image director for ShootPX, an AI fashion ecommerce photography system.
+# rather than us hardcoding a framing rule per category. Kept verbatim from the pre-merge
+# PROMPT_WRITER_SYSTEM_GENERAL/INTIMATE prompts below, combined into one system prompt instead
+# of two selected by a prior classification call (see this section's header comment).
+SHOOT_ANALYST_SYSTEM = """You are the creative image director for ShootPX, an AI fashion ecommerce photography system, and you have THREE jobs in one response:
 
-Your prompts are sent directly to a professional image-generation/editing model.
+JOB 1 — PRODUCT UNDERSTANDING:
+You are given a labeled sequence of images: one model reference (#Image1), one or more products (a product may have multiple angle images sharing the same label), and optional style/pose references. For each product listed, determine:
+- type: a short specific noun phrase, e.g. "bra", "t-shirt", "sneakers", "watch", "baseball cap", "tote bag"
+- category: "intimate" if it is intimate apparel, underwear, lingerie, or swimwear worn as underwear — otherwise "general"
+- body_placement: one of "upper_body", "lower_body", "full_body", "feet", "head", "wrist", "hand", "neck", "shoulder", "waist", "carried" — or another short specific value if none of these fit
 
-The goal is to create beautiful, realistic, commercially usable product photography that a fashion brand can confidently use on ecommerce stores and marketplaces such as Myntra, Amazon, Flipkart and Shopify.
+JOB 2 — USER INSTRUCTION SAFETY:
+If a user creative instruction is supplied, judge "user_instruction_safe": false if it implies, even subtly or indirectly, sexually explicit/inappropriate content, nudity, or an underage subject. Ordinary style/scene direction — including mentioning an intimate product by name, since that may be the actual product being sold — is NOT a violation on its own. If no user instruction is supplied, user_instruction_safe is true.
+
+JOB 3 — POSE PROMPT WRITING (skip if user_instruction_safe is false — return empty prompts):
+Your prompts are sent directly to a professional image-editing model (Seedream) that takes the same numbered reference images you are shown — #Image1, #Image2, #Image3, etc. — and edits them together. That editing model can already see every pixel of every reference image. It does not need you to describe what a reference image looks like — it needs you to tell it, briefly, which image plays which role and what to do with them.
 
 The supplied product is the hero of the image. The model, pose, lighting and environment exist to present the product beautifully.
 
+IMAGE REFERENCE SYNTAX (read this carefully — this is the most important rule):
+Every prompt you write MUST refer to the supplied images by their number tags exactly as given to you (e.g. #Image1, #Image2), never by a description of what they show. Use the tags to assign roles, e.g.: "Dress the model in #Image1 with the product from #Image2." Do NOT restate, re-describe or re-specify any visual attribute that is already visible in a reference image — not its color, pattern, print, texture, silhouette, stitching, trim, strap, closure, hardware, or any other detail. The editing model copies those details directly from the pixels of the reference image; writing them out in words does not improve fidelity, it invites the model to "correct" or reinterpret details that were already correct, which is a common cause of hallucinated colors, warped patterns and broken stitching. If a detail is visible in a reference image, your job is to point at that image with its tag, not to describe the detail. Only write words for what is NOT already visible in a reference image: the pose, camera angle, framing, composition, lighting, environment, and how the product and model should interact.
+
 Prioritize, in this order:
-1. Accurate preservation of the supplied product
+1. Accurate preservation of the supplied product (via correct #ImageN referencing, not description)
 2. Clear and attractive product presentation
 3. Natural fit and believable interaction with the model
 4. Strong ecommerce composition
@@ -531,234 +609,44 @@ Prioritize, in this order:
 8. Clean, polished background and lighting
 
 PRODUCT:
-Treat the supplied product image as the source of truth.
-Preserve the product's recognizable design, silhouette, proportions, construction, materials, colors, patterns, textures, seams, stitching, trims, hardware and other visible details.
-
-Do not unnecessarily redesign, simplify or invent product details.
+Treat the tagged product image(s) as the source of truth. Reference them by tag only. Never re-describe the product's design, silhouette, proportions, construction, materials, colors, patterns, textures, seams, stitching, trims or hardware — the editing model already sees them in the tagged image. Do not unnecessarily redesign, simplify or invent product details. Do not invent a different product or turn a reference garment into a generic version of the product.
 
 COMPOSITION:
-Choose framing appropriate to the product category.
-The product should occupy a meaningful portion of the image and remain easy to see.
-Avoid unnecessary empty space.
-Avoid poses, hair, hands, arms, props or camera angles that hide important product details.
-Do not force every product into the same crop.
+Choose framing appropriate to the product category. The product should occupy a meaningful portion of the image and remain easy to see. Avoid unnecessary empty space. Avoid poses, hair, hands, arms, props or camera angles that hide important product details. Do not force every product into the same crop.
 
 PRODUCT-CATEGORY FRAMING:
-
 Choose framing based on what is being sold.
-
-Upper-body garments:
-Use upper-body or half-body framing when appropriate.
-
-Full-body garments:
-Show enough of the body to clearly present the complete garment without excessive empty space.
-
-Footwear:
-Use a lower-body or full-body composition that makes the footwear clearly visible.
-
-Watches, jewelry and small accessories:
-Use a closer composition where the product is large and easy to evaluate.
-
-Hats and headwear:
-Keep the head and product clearly visible.
-
-Bags and carried accessories:
-Show the complete product and, where useful, how it is naturally carried or worn.
-
+Upper-body garments: use upper-body or half-body framing when appropriate.
+Full-body garments: show enough of the body to clearly present the complete garment without excessive empty space.
+Footwear: use a lower-body or full-body composition that makes the footwear clearly visible.
+Watches, jewelry and small accessories: use a closer composition where the product is large and easy to evaluate.
+Hats and headwear: keep the head and product clearly visible.
+Bags and carried accessories: show the complete product and, where useful, how it is naturally carried or worn.
 Do not force a fixed camera crop when it would reduce product visibility.
 
+FOR ANY PRODUCT YOU CLASSIFIED AS "intimate" IN JOB 1, ALSO APPLY THESE ADDITIONAL RULES (skip this block entirely for general-category products):
+Create premium, attractive, realistic ecommerce fashion photography for brands selling on marketplaces such as Myntra, Amazon, Flipkart and Shopify — high-quality mainstream fashion retail photography: polished, confident, modern, attractive and commercially usable. The intimate-apparel product is the commercial hero; the adult model exists to present it naturally and professionally. For intimate upper-body garments, generally favor close or medium upper-body compositions where the garment is large enough to clearly evaluate while still presenting the model naturally. The garment should receive more visual attention than the model's face, background or environment. INTIMATE APPAREL SAFETY: the model must be clearly an adult; keep the photography suitable for mainstream fashion ecommerce; use tasteful fashion poses and professional commercial presentation; avoid sexualized, explicit or boudoir-style direction.
+
 PHOTOGRAPHY:
-Create the visual quality of a premium commercial fashion shoot rather than a generic AI-generated image.
-Use believable professional lighting, realistic shadows, accurate color, natural skin and material texture, realistic perspective and tasteful retouching.
+Create the visual quality of a premium commercial fashion shoot rather than a generic AI-generated image. Use believable professional lighting, realistic shadows, accurate color, natural skin and material texture, realistic perspective and tasteful retouching, refined but realistic. Do not make every image look identical — allow tasteful variation in pose, camera angle, expression, lighting and composition while maintaining product visibility.
 
 STYLE:
-Aim for aspirational, polished and contemporary ecommerce fashion photography.
-The image should feel attractive enough for a brand's storefront while remaining commercially practical.
+Aim for aspirational, polished and contemporary ecommerce fashion photography. The image should feel attractive enough for a brand's storefront while remaining commercially practical.
 
 REFERENCES:
-Use the supplied product and model references as the primary source of truth.
-Additional reference images may guide composition, pose, lighting, framing or photographic style.
-Use them as visual inspiration only and do not copy unrelated products, branding, logos, text or identities.
+Use the tagged product and model images as the primary source of truth, referenced only by tag. Additional reference images may guide composition, pose, lighting, framing or photographic style — reference those by tag too, and only for the non-visual direction they add (e.g. "match the camera angle of #Image4"), never by describing their contents. Do not copy unrelated products, branding, logos, text or identities from any reference image.
 
 POSE VARIETY:
 When generating multiple images, make each pose and camera angle meaningfully different while maintaining product visibility and commercial usefulness.
 
 PROMPT STYLE:
-Write concise, direct instructions for the image-generation model.
-Do not write a long scene description.
-Do not unnecessarily describe attributes already visible in the reference images.
-Do not overuse negative instructions.
-Every prompt must be self-contained and directly usable by the image-generation model.
+Write short, direct instructions for the image-editing model, built around #ImageN tags. Do not write a long scene description. Do not describe any attribute already visible in a reference image — point at its tag instead. Do not overuse negative instructions. Every prompt must be self-contained and directly usable by the image-editing model.
 
-Return only the requested JSON structure."""
+Example of the shape to write (adapt the tags/roles/pose to the actual images and pose direction you were given — never copy this example's wording):
+"#Image2 is the product. #Image1 is the model. Dress the model in #Image1 with the product from #Image2. Front-facing hero composition, confident natural pose, clean studio lighting."
 
-# Same creative-director philosophy as GENERAL, with intimate-apparel-specific fidelity and
-# safety guidance layered in — deliberately not a "25 things you must never do" checklist,
-# since that pushes the image model toward stiff catalog photography. Product review pass,
-# 2026-08-29.
-PROMPT_WRITER_SYSTEM_INTIMATE = """You are the creative image director for ShootPX, an AI fashion ecommerce photography system.
-
-Your prompts are sent directly to a professional image-generation/editing model.
-
-Create premium, attractive, realistic ecommerce fashion photography for brands selling products on marketplaces and online stores such as Myntra, Amazon, Flipkart and Shopify.
-
-The supplied intimate-apparel product is the commercial hero. The adult model exists to present the product naturally and professionally.
-
-The desired result should feel like high-quality mainstream fashion retail photography: polished, confident, modern, attractive and commercially usable.
-
-PRIORITY:
-1. Preserve the supplied garment accurately
-2. Present the garment clearly and attractively
-3. Achieve realistic fit and natural garment-to-body interaction
-4. Create strong ecommerce composition
-5. Produce beautiful professional photography
-6. Use a natural, confident model pose
-7. Keep the overall presentation tasteful and retail appropriate
-
-GARMENT FIDELITY:
-Treat the garment reference as the authoritative product reference.
-
-Preserve its recognizable:
-- silhouette
-- proportions
-- construction
-- materials
-- colors
-- patterns
-- textures
-- seams
-- stitching
-- trims
-- straps
-- closures
-- hardware
-- visible branding or product details
-
-The image-generation model should adapt the garment naturally to the adult model's body without unnecessarily changing the garment itself.
-
-Do not invent a different product or turn the reference garment into a generic version of the product.
-
-COMPOSITION:
-Use attractive ecommerce fashion framing appropriate to the garment.
-
-For intimate upper-body garments, generally favor close or medium upper-body compositions where the garment is large enough to clearly evaluate while still presenting the model naturally.
-
-Keep important garment areas visible.
-Avoid unnecessary obstruction from hair, hands, arms or extreme poses.
-
-The garment should receive more visual attention than the model's face, background or environment.
-
-PRODUCT-CATEGORY FRAMING:
-
-Choose framing based on what is being sold.
-
-Upper-body garments:
-Use upper-body or half-body framing when appropriate.
-
-Full-body garments:
-Show enough of the body to clearly present the complete garment without excessive empty space.
-
-Footwear:
-Use a lower-body or full-body composition that makes the footwear clearly visible.
-
-Watches, jewelry and small accessories:
-Use a closer composition where the product is large and easy to evaluate.
-
-Hats and headwear:
-Keep the head and product clearly visible.
-
-Bags and carried accessories:
-Show the complete product and, where useful, how it is naturally carried or worn.
-
-Do not force a fixed camera crop when it would reduce product visibility.
-
-PHOTOGRAPHY:
-Aim for premium commercial fashion photography with:
-- soft professional lighting
-- realistic shadows
-- accurate color
-- realistic skin and fabric texture
-- believable perspective
-- natural proportions
-- refined but realistic retouching
-- clean contemporary styling
-
-Do not make every image look identical. Allow tasteful variation in pose, camera angle, expression, lighting and composition while maintaining product visibility.
-
-REFERENCE IMAGES:
-Use supplied images as the source of truth for the person and product.
-Optional reference images can guide composition, pose, lighting or photography style.
-Do not copy unrelated branding, text, products or identities from reference images.
-
-INTIMATE APPAREL SAFETY:
-The model must be clearly an adult.
-Keep the photography suitable for mainstream fashion ecommerce.
-Use tasteful fashion poses and professional commercial presentation.
-Avoid sexualized, explicit or boudoir-style direction.
-
-PROMPT STYLE:
-Write concise, directive image-generation instructions.
-Do not unnecessarily describe details already visible in the supplied references.
-Avoid excessive negative instructions.
-Focus on giving the image model the information needed to produce an excellent commercial photograph.
-
-Return only the requested JSON structure."""
-
-PROMPT_WRITER_CONFIG = {
-    "general": {
-        "model": os.environ.get("PROMPT_WRITER_MODEL_GENERAL", MODEL_CONFIG["prompt_writer"]),
-        "system": PROMPT_WRITER_SYSTEM_GENERAL,
-    },
-    "intimate": {
-        "model": os.environ.get("PROMPT_WRITER_MODEL_INTIMATE", MODEL_CONFIG["prompt_writer"]),
-        "system": PROMPT_WRITER_SYSTEM_INTIMATE,
-    },
-}
-
-PRODUCT_CLASSIFIER_SYSTEM = """You are a product-understanding classifier for an e-commerce fashion photography pipeline.
-
-You are given a labeled sequence of images: one model reference, one or more products (a product may have multiple angle images sharing the same label), and optional style/pose references.
-
-For each product listed, determine:
-- type: a short specific noun phrase, e.g. "bra", "t-shirt", "sneakers", "watch", "baseball cap", "tote bag"
-- category: "intimate" if it is intimate apparel, underwear, lingerie, or swimwear worn as underwear — otherwise "general"
-- body_placement: one of "upper_body", "lower_body", "full_body", "feet", "head", "wrist", "hand", "neck", "shoulder", "waist", "carried" — or another short specific value if none of these fit
-
-Return ONLY a JSON array with exactly one object per product, in the exact order the products were listed: [{"type": "...", "category": "intimate"|"general", "body_placement": "..."}, ...]."""
-
-
-def classify_products_via_vlm(image_urls: list[str], labels: list[str], products: list[Product]) -> dict:
-    """Node: VLM product understanding — direct replacement for the old
-    classify_garment_category(garment_type) keyword router (see section 5's header comment).
-    Looks at the actual product images instead of a user-typed string and returns, per
-    product, its type/category/body_placement, plus one overall_category that
-    generate_pose_prompts_via_vlm routes on.
-
-    overall_category is 'intimate' the moment ANY product classifies as intimate apparel —
-    the intimate system prompt's fidelity/safety rules need to apply to the whole shoot
-    whenever intimate apparel is present at all, not just to that one product.
-
-    Classification is requested as a plain ordered array (matching `products`' order), not
-    keyed by an id/label the VLM would have to echo back correctly — the ids/labels attached
-    to each result below are ours, from `products`, not anything the VLM returned."""
-    product_list_text = "\n".join(f"{i+1}. {p['label']}" for i, p in enumerate(products))
-    result = _vlm_json_call(
-        model=MODEL_CONFIG["prompt_writer"],
-        system=PRODUCT_CLASSIFIER_SYSTEM,
-        prompt=(
-            "Images in order:\n" + "\n".join(labels)
-            + "\n\nProducts to classify, in this order:\n" + product_list_text
-        ),
-        image_urls=image_urls,
-        max_tokens=800,
-    )
-    if len(result) != len(products):
-        raise RuntimeError(
-            f"classify_products_via_vlm: expected {len(products)} entries, got {len(result)}"
-        )
-    classified = [{"id": p["id"], "label": p["label"], **entry} for p, entry in zip(products, result)]
-    overall_category = "intimate" if any(c["category"] == "intimate" for c in classified) else "general"
-    return {"products": classified, "overall_category": overall_category}
+Return ONLY a JSON object of this exact shape:
+{"products": [{"type": "...", "category": "intimate"|"general", "body_placement": "..."}, ...one entry per product in the order listed...], "user_instruction_safe": true|false, "user_instruction_reason": "<short reason, empty string if safe or no instruction>", "prompts": ["...", ...N strings, empty array if user_instruction_safe is false...]}."""
 
 
 # Product review pass, 2026-08-29: category-neutral composition *directions*, not hardcoded
@@ -772,87 +660,124 @@ DEFAULT_POSES = [
 ]
 
 
-def generate_pose_prompts_via_vlm(
-    image_urls: list[str], labels: list[str], classification: dict, num_poses: int = 4, user_instruction: str | None = None,
-) -> list[str]:
-    """Nodes: Router -> 'VLM writes N distinct pose prompts' -> the four DEFAULT_POSES,
-    adapted per-category by the system prompt. `classification` is classify_products_via_vlm's
-    return value. user_instruction (from the "optional generation instructions" field) is
-    passed through as creative direction on top of the fixed fidelity/framing rules — the VLM
-    always writes the N prompts, a user instruction never bypasses it (that would just repeat
-    one prompt N times with no real pose variety)."""
-    category = classification["overall_category"]
-    cfg = PROMPT_WRITER_CONFIG[category]
+def analyze_shoot_and_generate_prompts(
+    image_urls: list[str], labels: list[str], products: list[Product], num_poses: int = 4, user_instruction: str | None = None,
+) -> dict:
+    """ONE Gemini call replacing classify_products_via_vlm + generate_pose_prompts_via_vlm + the
+    user-instruction-safety VLM escalation (see this section's header comment for why). Returns
+    {"products": [...], "overall_category": "intimate"|"general", "user_instruction_safe": bool,
+    "user_instruction_reason": str, "prompts": [...]}.
+
+    Classification is requested as a plain ordered array (matching `products`' order), not keyed
+    by an id/label the VLM would have to echo back correctly — the ids/labels attached to each
+    result below are ours, from `products`, not anything the VLM returned. overall_category is
+    'intimate' the moment ANY product classifies as intimate apparel — the intimate-specific
+    fidelity/safety rules apply to the whole shoot whenever intimate apparel is present at all.
+
+    Does NOT raise on an unsafe user_instruction_safe or on the child+intimate combination —
+    those are reported here and enforced by the CALLER in Python (check_user_text_safety's
+    deterministic pass already ran before this call; check_model_product_compatibility runs
+    after, in run_generation_from_model_image), per section 6's "AI can classify, code makes the
+    final business decision"."""
     poses = DEFAULT_POSES[:num_poses]
-    product_summary = "; ".join(
-        f"{p['label']} ({p['type']}, {p['body_placement']})" for p in classification["products"]
-    )
+    product_list_text = "\n".join(f"{i+1}. {p['label']}" for i, p in enumerate(products))
 
     prompt_text = (
         "Images in order:\n" + "\n".join(labels)
-        + f"\n\nCreate {num_poses} distinct production-ready image-edit prompts "
-        f"for a premium ecommerce fashion shoot showing the supplied products — "
-        f"{product_summary} — on the supplied adult model. "
-        f"Use these four composition directions in order: {poses}. "
-        f"Adapt framing, camera distance, body positioning, expression, lighting "
-        f"and photographic styling intelligently to each product's category and body placement. "
-        f"Every product must remain clearly visible and presented as intended. "
-        f"Make every prompt meaningfully different while keeping the products "
-        f"clearly visible and commercially attractive. "
+        + "\n\nProducts to classify, in this order:\n" + product_list_text
+        + f"\n\nIf user_instruction_safe, create {num_poses} distinct production-ready image-edit "
+        f"prompts for a premium ecommerce fashion shoot showing the supplied products on the "
+        f"supplied adult model. Use these composition directions in order: {poses}. Adapt framing, "
+        f"camera distance, body positioning, expression, lighting and photographic styling "
+        f"intelligently to each product's category and body placement. Every product must remain "
+        f"clearly visible and presented as intended. Make every prompt meaningfully different "
+        f"while keeping the products clearly visible and commercially attractive."
     )
     if user_instruction:
         prompt_text += (
             f"\n\n{USER_PROMPT_FIDELITY_GUARDRAIL}\n"
-            f"User's creative direction (style/scene guidance only, does not override the "
-            f"rules above): {user_instruction}\n"
+            f"User's creative direction to judge for JOB 2 and, if safe, use for JOB 3 (style/scene "
+            f"guidance only, does not override the rules above): {user_instruction}\n"
         )
-    prompt_text += f"Return ONLY a JSON array of {num_poses} strings, nothing else."
-
-    prompts = _vlm_json_call(
-        model=cfg["model"], system=cfg["system"], prompt=prompt_text,
-        image_urls=image_urls, max_tokens=1500,
-    )
-    print(f"router: products={[p['label'] for p in classification['products']]!r} -> overall_category={category!r} (model={cfg['model']})")
-    return prompts
-
-
-# =============================================================================
-# 6. Local safety pre-check
-# =============================================================================
-
-PROMPT_BLOCKED_TERMS = ["child", "minor", "teen", "kid", "underage"]
-
-
-# Same calibration fix as check_image_nsfw, 2026-08-29 — applied here too since this gate
-# has the identical false-positive risk on legitimate adult models in intimate apparel.
-def run_local_safety_check(prompt_text: str, image_urls: list[str]) -> tuple[bool, str]:
-    """Node: 'Local safety pre-check' -> 'Passed?'. Returns (passed, reason)."""
-    text = prompt_text.lower()
-    for term in PROMPT_BLOCKED_TERMS:
-        if term in text:
-            return False, f"blocked term '{term}' in prompt text"
+    else:
+        prompt_text += "\n\nNo user creative instruction was supplied — user_instruction_safe is true."
 
     result = _vlm_json_call(
-        model=MODEL_CONFIG["safety_check"],
-        system=(
-            "You are a content-safety classifier for an e-commerce fashion photo pipeline "
-            "about to generate an on-model shot from these input images. Check two things "
-            "only:\n"
-            "1. Age: does any person shown look like they could plausibly be under 18 — a "
-            "genuine, specific reason to suspect a minor, not just youthful-looking? "
-            "Professional adult models can have soft lighting, minimal makeup, or delicate "
-            "features and still be obviously adult — do not flag on youthfulness alone.\n"
-            "2. Explicit content: sexually explicit (visible nudity, exposed genitalia/"
-            "nipples, sexual poses)? Ordinary e-commerce underwear/lingerie/swimwear "
-            "photography — the actual product being sold — is NOT explicit on its own, "
-            "including for intimate-apparel garments.\n"
-            'Respond with ONLY a JSON object: {"pass": true|false, "reason": "short reason"}.'
-        ),
-        prompt="Classify these images per the rules in the system prompt.",
-        image_urls=image_urls,
-        max_tokens=200,
+        model=MODEL_CONFIG["prompt_writer"], system=SHOOT_ANALYST_SYSTEM, prompt=prompt_text,
+        image_urls=image_urls, max_tokens=2000,
     )
-    return bool(result["pass"]), result.get("reason", "")
+
+    classified_raw = result.get("products", [])
+    if len(classified_raw) != len(products):
+        raise RuntimeError(
+            f"analyze_shoot_and_generate_prompts: expected {len(products)} product entries, got {len(classified_raw)}"
+        )
+    classified = [{"id": p["id"], "label": p["label"], **entry} for p, entry in zip(products, classified_raw)]
+    overall_category = "intimate" if any(c["category"] == "intimate" for c in classified) else "general"
+
+    print(f"router: products={[p['label'] for p in classified]!r} -> overall_category={overall_category!r} (model={MODEL_CONFIG['prompt_writer']})")
+
+    return {
+        "products": classified,
+        "overall_category": overall_category,
+        "user_instruction_safe": bool(result.get("user_instruction_safe", True)),
+        "user_instruction_reason": result.get("user_instruction_reason", ""),
+        "prompts": result.get("prompts", []),
+    }
+
+
+# =============================================================================
+# 6. Deterministic business-rule gate + user-text safety
+# =============================================================================
+# Architecture, 2026-09-03: "child image" is not automatically unsafe — a child model is a
+# legitimate, normal case for children's ecommerce products. The specific blocked combination
+# is CHILD (or age-uncertain) MODEL + INTIMATE/UNDERGARMENT PRODUCT. This is a deterministic
+# backend rule, evaluated once model age_status and product category are both known — not a
+# VLM judgment call, and not re-checked per pose.
+
+CHILD_INTIMATE_BLOCK_MESSAGE = (
+    "Child models cannot be used for undergarment or intimate-apparel generation."
+)
+
+
+def check_model_product_compatibility(age_status: str, overall_category: str) -> None:
+    """Node: the child+intimate-product gate. Raises ValueError if age_status is "minor" or
+    "uncertain" AND overall_category is "intimate". Any other combination (including a child
+    model + general products, e.g. t-shirts/pants/shoes for children's ecommerce) is allowed."""
+    if overall_category == "intimate" and age_status in ("minor", "uncertain"):
+        raise ValueError(CHILD_INTIMATE_BLOCK_MESSAGE)
+
+
+# Deterministic keyword pass for explicit/sexual user free-text intent — cheap, runs first,
+# catches the obvious cases for free (same shape as MINOR_AGE_BLOCKED_PATTERNS above).
+NSFW_BLOCKED_TERMS = [
+    "nude", "naked", "topless", "sex", "sexual", "erotic", "porn", "explicit",
+    "nsfw", "orgasm", "masturbat", "genitalia", "penis", "vagina", "fetish",
+]
+
+
+# Architecture, 2026-09-03 ("Merge B"): this used to also escalate to its OWN Gemini call for
+# ambiguous phrasing. That escalation call is now folded into analyze_shoot_and_generate_prompts
+# (section 5) — its "user_instruction_safe"/"user_instruction_reason" output IS that second,
+# independent judgment layer, made in the same request that also classifies products and writes
+# pose prompts, instead of a separate round trip for the same input. So this function is now
+# ONLY the deterministic pre-filter: free, always runs first (catches the obvious cases and any
+# minor-age phrasing before spending the merged call), never itself calls a VLM. The caller
+# (run_generation_from_model_image) still enforces the merged call's user_instruction_safe
+# verdict in Python afterward — see this section's header comment: "AI can classify, code makes
+# the final business decision."
+def check_user_text_safety_deterministic(text: str) -> None:
+    """Node: user free-text safety gate, deterministic half (additional_notes / "optional
+    generation instructions"). Raises ValueError on a blocked phrase/term; the VLM judgment on
+    subtler phrasing is analyze_shoot_and_generate_prompts' user_instruction_safe output, not a
+    separate call from here."""
+    if not text:
+        return
+    check_text_for_minor_age(text)
+    lowered = text.lower()
+    for term in NSFW_BLOCKED_TERMS:
+        if term in lowered:
+            raise ValueError(f"Blocked: instruction implies explicit/sexual content ('{term}').")
 
 
 # =============================================================================
@@ -886,8 +811,8 @@ def run_final_generation(
 
 # UI note: label this field "Optional generation instructions", not "Prompt" — it's meant to
 # steer style/scene on top of the fixed rules already in the system prompt, not replace them.
-# Referenced from generate_pose_prompts_via_vlm() in section 5 (Python resolves this at call
-# time, so the later definition here is fine) — a user instruction is always handed to the
+# Referenced from analyze_shoot_and_generate_prompts() in section 5 (Python resolves this at
+# call time, so the later definition here is fine) — a user instruction is always handed to the
 # VLM alongside this guardrail, never used to bypass the VLM and repeat one prompt N times.
 USER_PROMPT_FIDELITY_GUARDRAIL = (
     "Use the supplied product reference as the source of truth. "
@@ -901,6 +826,7 @@ USER_PROMPT_FIDELITY_GUARDRAIL = (
 def run_generation_from_model_image(
     model_image_url: str,
     products: list[Product],
+    model_age_status: str = "adult",         # "adult" | "minor" | "uncertain" — see resolve_model_image
     reference_paths: list[str] | None = None,
     resolution_mode: str = "standard",       # 'standard' | 'auto_2K' | 'auto_4K' | 'custom'
     aspect_ratio: str = "3:4",               # used when resolution_mode == 'standard'
@@ -912,24 +838,40 @@ def run_generation_from_model_image(
 ) -> dict:
     """Everything from 'Assemble ordered image list' through 'Return final image set' — the
     part of the flow that's the same regardless of how model_image_url was resolved. Both
-    run_on_model_shot() (below) and streamlit_app.py call this once they have a model image."""
+    run_on_model_shot() (below) and streamlit_app.py call this once they have a model image.
+
+    model_age_status feeds the child+intimate-product gate below — the app doesn't know
+    whether a child model is allowed until it knows what product is being shown (see section
+    6's header comment), so that gate can only run here, once classification exists, not at
+    model-resolution time."""
     on_image = on_image or show
+
+    # User free-text safety gate, deterministic half, runs on the RAW instruction before ANY
+    # VLM call — free, catches the obvious cases (section 6). The VLM judgment on subtler
+    # phrasing happens inside analyze_shoot_and_generate_prompts below (its
+    # user_instruction_safe output), not as a separate escalation call from here.
+    if user_prompt:
+        check_user_text_safety_deterministic(user_prompt)
 
     image_urls, labels = assemble_inputs(model_image_url, products, reference_paths)
 
-    # VLM product understanding (section 5) — what each product is, before writing any pose
-    # prompts. Replaces the old user-typed garment_type string entirely.
-    classification = classify_products_via_vlm(image_urls, labels, products)
+    # ONE Gemini call (section 5): product classification + user-instruction safety judgment +
+    # N pose prompts, all in one response — replaces the old
+    # classify_products_via_vlm/generate_pose_prompts_via_vlm pair plus the user-text VLM
+    # escalation. Runs ONCE per shoot, not per pose.
+    analysis = analyze_shoot_and_generate_prompts(image_urls, labels, products, num_poses, user_instruction=user_prompt)
 
-    # Always routed through the VLM — a user instruction is creative direction layered onto
-    # the N-distinct-prompts step, not a bypass of it (bypassing would just repeat one prompt
-    # N times, which is sampling variation, not real pose/framing diversity).
-    prompts = generate_pose_prompts_via_vlm(image_urls, labels, classification, num_poses, user_instruction=user_prompt)
+    # Gemini's user_instruction_safe is a REPORT, not a decision — Python enforces it. Section
+    # 6: "AI can classify, code makes the final business decision."
+    if not analysis["user_instruction_safe"]:
+        raise ValueError(f"Blocked at instruction safety check: {analysis['user_instruction_reason']}")
 
-    combined_prompt_text = " ".join(prompts)
-    passed, reason = run_local_safety_check(combined_prompt_text, image_urls)
-    if not passed:
-        raise ValueError(f"Blocked at local safety pre-check: {reason}")
+    # The deterministic business-rule gate: child (or age-uncertain) model + intimate product
+    # is blocked; child model + general products is fine (see section 6). Also never overridden
+    # by anything Gemini reports — evaluated here in Python against analysis["overall_category"].
+    check_model_product_compatibility(model_age_status, analysis["overall_category"])
+
+    prompts = analysis["prompts"]
 
     outputs = []
     for i, p in enumerate(prompts):
@@ -945,7 +887,7 @@ def run_generation_from_model_image(
             on_image(u, f"Pose {i+1}")
 
     return {
-        "model_image": model_image_url, "products": classification["products"],
+        "model_image": model_image_url, "products": analysis["products"],
         "prompts": prompts, "image_urls": image_urls, "labels": labels, "outputs": outputs,
     }
 
@@ -953,7 +895,7 @@ def run_generation_from_model_image(
 def run_on_model_shot(
     model_mode: str,                      # "generate" | "upload" | "default"
     products: list[Product],
-    model_gender: str = "", model_age_bracket: str = "", model_skin_tone: str = "", model_body_type: str = "",
+    model_gender: str = "", model_age_bracket: str = "", model_ethnicity: str = "", model_skin_tone: str = "", model_body_type: str = "",
     model_additional_notes: str = "",     # for "generate"
     model_upload_path: str | None = None,  # for "upload"
     model_preset_id: str | None = None,    # for "default"
@@ -971,9 +913,10 @@ def run_on_model_shot(
     run_generation_from_model_image(). An interactive UI should call resolve_model_image() /
     generate_model_candidate() and run_generation_from_model_image() separately instead —
     see streamlit_app.py."""
-    model_image = resolve_model_image(
+    model = resolve_model_image(
         mode=model_mode,
-        gender=model_gender, age_bracket=model_age_bracket, skin_tone=model_skin_tone, body_type=model_body_type,
+        gender=model_gender, age_bracket=model_age_bracket, ethnicity=model_ethnicity,
+        skin_tone=model_skin_tone, body_type=model_body_type,
         additional_notes=model_additional_notes,
         upload_path=model_upload_path,
         preset_id=model_preset_id,
@@ -981,8 +924,9 @@ def run_on_model_shot(
         on_image=on_image,
     )
     return run_generation_from_model_image(
-        model_image_url=model_image,
+        model_image_url=model["url"],
         products=products,
+        model_age_status=model["age_status"],
         reference_paths=reference_paths,
         resolution_mode=resolution_mode, aspect_ratio=aspect_ratio,
         custom_width=custom_width, custom_height=custom_height,
